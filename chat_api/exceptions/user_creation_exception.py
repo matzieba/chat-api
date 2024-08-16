@@ -1,0 +1,2 @@
+class UserCreationException(Exception):
+    pass

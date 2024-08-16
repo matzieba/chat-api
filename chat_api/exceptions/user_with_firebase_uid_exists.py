@@ -1,0 +1,2 @@
+class UserWithThisFirebaseUIDExists(Exception):
+    pass

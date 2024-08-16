@@ -1,0 +1,102 @@
+definitions:
+  caches:
+    precommit: $HOME/.cache/pre-commit
+  services:
+    postgres:
+      image: postgres
+      environment:
+        POSTGRES_DB: 'chat_api'
+        POSTGRES_USER: 'chat_api'
+        POSTGRES_PASSWORD: 'chat_api'
+  steps:
+    - step: &build
+        image: python:3.9
+        name: Build app
+        caches:
+          - pip
+        script:
+          - mkdir static
+          - pip install -r requirements.txt
+          - python manage.py collectstatic
+        artifacts:
+          - static/**
+    - step: &code_quality_check
+        image: python:3.9
+        name: Check code quality
+        caches:
+          - pip
+          - precommit
+        script:
+          - pip install -r requirements.txt
+          - PRE_COMMIT_HOME=$HOME/.cache/pre-commit pre-commit run --all-files --show-diff-on-failure
+    - step: &safety
+        image: python:3.9
+        name: Check dependencies with safety
+        caches:
+          - pip
+        script:
+          - pip install -r requirements.txt
+          - python -m safety check
+    - step: &unit_tests
+        image: python:3.9
+        name: Testing
+        caches:
+          - pip
+        script:
+          - pip install -r requirements.txt
+          - export CHAT_API_DB_PORT=5432
+          - python -m pytest --cov-report term --cov=chat_api --cov=chat_api_auth --cov-fail-under=85
+        services:
+          - postgres
+
+pipelines:
+  default:
+      - step: *code_quality_check
+      - step: *safety
+      - step: *unit_tests
+
+  branches:
+    develop:
+      - step: *code_quality_check
+      - step: *safety
+      - step: *unit_tests
+
+  tags:
+    release-*:
+      - step: *code_quality_check
+      - step: *safety
+      - step: *build
+      - step: *unit_tests
+      - step:
+          image: google/cloud-sdk
+          name: Deploy to beta
+          deployment: staging
+          script:
+            - echo ${GOOGLE_CLIENT_SECRET_BETA} > client-secret.json
+            - echo ${FIREBASE_CERT_BETA} > firebase-cert.json
+            - gcloud config set project ${GCP_PROJECT_BETA}
+            - gcloud auth activate-service-account --key-file client-secret.json
+            - gcloud app deploy app-beta.yaml --quiet --verbosity=error --promote
+      - step:
+          image: google/cloud-sdk
+          name: Deploy to prod
+          deployment: production
+          trigger: manual
+          script:
+            - echo ${GOOGLE_CLIENT_SECRET_PROD} > client-secret.json
+            - echo ${FIREBASE_CERT_PROD} > firebase-cert.json
+            - gcloud config set project ${GCP_PROJECT_PROD}
+            - gcloud auth activate-service-account --key-file client-secret.json
+            - gcloud app deploy app-prod.yaml --quiet --verbosity=error --promote
+    hotfix-*:
+      - step: *build
+      - step:
+          image: google/cloud-sdk
+          name: Deploy to prod
+          deployment: production
+          script:
+            - echo ${GOOGLE_CLIENT_SECRET_PROD} > client-secret.json
+            - echo ${FIREBASE_CERT_PROD} > firebase-cert.json
+            - gcloud config set project ${GCP_PROJECT_PROD}
+            - gcloud auth activate-service-account --key-file client-secret.json
+            - gcloud app deploy app-prod.yaml --quiet --verbosity=error --promote

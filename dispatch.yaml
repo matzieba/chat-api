@@ -1,0 +1,3 @@
+#dispatch:
+#  - url: "*/<path>/v1/*"
+#    service: chat_api

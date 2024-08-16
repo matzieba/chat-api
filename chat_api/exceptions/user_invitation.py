@@ -1,0 +1,2 @@
+class UserInvitationDoesNotExistException(Exception):
+    pass
