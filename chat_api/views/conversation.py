@@ -31,6 +31,25 @@ class ConversationViewSet(viewsets.ModelViewSet):
     queryset = Conversation.objects.all()
     serializer_class = ConversationSerializer
 
+    def retrieve(self, request, *args, **kwargs):
+        """
+        Retrieve a model instance.
+        """
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+
+        if not instance.messages.exists():
+            chat_processor = ChatProcessor(instance.user.id, conversation=instance)
+            greeting_message = chat_processor.create_message('', 'assistant')
+            greeting_text = chat_processor.process_chat([greeting_message])
+            Message.objects.create(
+                conversation=instance,
+                message_text=greeting_text,
+                timestamp=now(),
+                role='assistant'
+            )
+
+        return Response(serializer.data)
 
     @action(detail=True, methods=['post'])
     def messages(self, request, pk=None):
@@ -43,7 +62,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation = Conversation.objects.get(pk=conversation_id)
         past_messages = Message.objects.filter(conversation=conversation).order_by('timestamp')
 
-        chat_processor = ChatProcessor(conversation.user.id)
+        chat_processor = ChatProcessor(conversation.user.id, conversation)
 
         chat_messages = []
         for message in past_messages:

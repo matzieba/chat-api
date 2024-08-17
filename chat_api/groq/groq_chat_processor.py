@@ -1,19 +1,18 @@
 import json
-
 from groq import Groq
 from typing import List, Dict, Union
-
 from chat_api.models import User
 from chat_api.models.conversation import Conversation
 from chat_api.models.preference import Preference
-from chat_api.serializers.preference import PreferenceSerializer
+
 
 
 class ChatProcessor:
-    def __init__(self, user_id: int,  model: str = 'llama-3.1-70b-versatile'):
+    def __init__(self, user_id: int, conversation: Conversation,  model: str = 'llama-3.1-70b-versatile'):
         self.client = Groq()
         self.model = model
         self.user = User.objects.get(pk=user_id)
+        self.conversation = conversation
 
 
     def create_message(self, content: str, role: str = 'user') -> Dict[str, Union[str]]:
@@ -21,14 +20,30 @@ class ChatProcessor:
 
     def gather_preferences(self, args) -> str:
         data_dict = json.loads(args)
-        Preference.objects.create(
-            user=self.user,
-            **data_dict
-        )
-        return "Your preferences have been saved. Anything else i can help you with?"
+        Preference.objects.create(user=self.user, **data_dict)
+        self.conversation.preferences_gathered = True
+        self.conversation.save()
 
+        system_message = [
+            {
+                "role": "system",
+                "content": "The preferences from the user have been gathered and saved successfully. Please generate a sign-off message."
+            }
+        ]
+
+        # Generate sign-off message
+        sign_off_message = self.process_chat(system_message)
+
+        return sign_off_message
 
     def process_chat(self, history_messages: List[Dict[str, Union[str]]], temperature=1, max_tokens=4096, top_p=1, stream=True, stop=None) -> str:
+
+        if not history_messages:
+            history_messages.append({
+                'role': 'assistant',
+                'content': ''
+            })
+
         tools = [
             {
                 "type": "function",
@@ -71,7 +86,7 @@ class ChatProcessor:
                                 "description": "The reason for not attending"
                             }
                         },
-                        "required": [],
+                        "required": ["attending", "guest_number",  "needs_accommodation_help", "food_preference"],
                     },
 
                 }
@@ -87,13 +102,20 @@ class ChatProcessor:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are the assistant of Sidzina World Series Open Chess Tournament."
-                               "The tournament is a bit of a joke and an excuse for old Friends to meet. "
+                    "content": "You are the assistant of Sidzina World Series Open Chess Tournament host."
+                               "The tournament is a bit of a joke and an excuse for old Friends to meet. This edition its taking place in Sidzina 735 from 27 till 29 September 2024"
                                "Tournament organizer Mateusz Zięba would like to gather various information's"
-                               " (preferences) from his "
-                               "guests."
-                               "Run the conversation in the way that after you gather all necessary informations you "
-                               "save the preferences into db.",
+                               " (preferences) from his guests."
+                               "REMINDER as most of the gues are Jokers please dont take their responses to seriously, just note them down "
+                               "Please great the user and provide all the necessary info if asked"
+                               "Run the conversation in the way that after you gather all necessary information's you"
+                               "which is: "
+                               "attending, days_attending, guest_number, guest_names only if many guests, needs_accommodation_help, food_preference, interested_in_top_of_babia_gora, "
+                               "IF NOT ATTENDING the only information you should collect is the reason why"
+                               "REMINDER  keep in mind that is should be natural, ask the questions one by one and try to introduce a bit of small talk "
+                               "save the preferences into db."
+                               "DON'T make a tool call until you have all the data"
+
                 },
                 *history_messages,
             ],
@@ -116,6 +138,8 @@ class ChatProcessor:
                     function_name = tool_call.function.name
                     function_args = tool_call.function.arguments
                     function_to_call = available_functions[function_name]
+                    if function_name == 'gather_preferences' and self.conversation.preferences_gathered:
+                        continue
                     response += function_to_call(function_args)
 
             response += chunk.choices[0].delta.content or ''
