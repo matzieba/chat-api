@@ -20,11 +20,15 @@ class MessageSerializer(serializers.ModelSerializer):
 
 
 class ConversationSerializer(serializers.ModelSerializer):
-    messages = MessageSerializer(many=True, read_only=True)
+    messages = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
         fields = "__all__"
+
+    def get_messages(self, instance):
+        messages = instance.messages.order_by('timestamp')
+        return MessageSerializer(messages, many=True).data
 
 
 class ConversationViewSet(viewsets.ModelViewSet):
@@ -70,13 +74,15 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         chat_messages.append(chat_processor.create_message(user_message_text, 'user'))
         chat_response = chat_processor.process_chat(chat_messages)
-
-        user_message = Message.objects.create(
-            conversation=conversation,
-            message_text=user_message_text,
-            timestamp=now(),
-            role='user'
-        )
+        user_message = None
+        if not chat_response == 'The conversation has been reset.':
+            user_message = Message.objects.create(
+                conversation=conversation,
+                message_text=user_message_text,
+                timestamp=now(),
+                role='user'
+            )
+            user_message_serializer = MessageSerializer(user_message)
 
         assistant_message = Message.objects.create(
             conversation=conversation,
@@ -85,10 +91,10 @@ class ConversationViewSet(viewsets.ModelViewSet):
             role='assistant'
         )
 
-        user_message_serializer = MessageSerializer(user_message)
-        assistant_message_serializer = MessageSerializer(assistant_message)
 
+        assistant_message_serializer = MessageSerializer(assistant_message)
+        user_message_serializer = MessageSerializer(user_message) if user_message else None
         return Response({
-            'user_message': user_message_serializer.data,
+            'user_message': user_message_serializer.data if user_message_serializer else {},
             'assistant_message': assistant_message_serializer.data,
         }, status=status.HTTP_200_OK)

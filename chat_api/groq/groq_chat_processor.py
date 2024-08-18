@@ -37,6 +37,10 @@ class ChatProcessor:
         return sign_off_message
 
     def process_chat(self, history_messages: List[Dict[str, Union[str]]], temperature=1, max_tokens=4096, top_p=1, stream=True, stop=None) -> str:
+        for message in history_messages:
+            if message['content'].upper() == "RESET":
+                self.reset_conversation()
+                return "The conversation has been reset."
 
         if not history_messages:
             history_messages.append({
@@ -145,3 +149,8 @@ class ChatProcessor:
             response += chunk.choices[0].delta.content or ''
 
         return response
+
+    def reset_conversation(self):
+        self.conversation.messages.all().delete()
+        self.conversation.proposal_saved = False
+        self.conversation.save()
