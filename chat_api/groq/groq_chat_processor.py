@@ -27,7 +27,7 @@ class ChatProcessor:
         system_message = [
             {
                 "role": "system",
-                "content": "The preferences from the user have been gathered and saved successfully. Please generate a sign-off message."
+                "content": "The preferences from the user have been gathered and saved successfully. Please generate a sign-off message asking if you can help with anything else."
             }
         ]
 
@@ -36,7 +36,7 @@ class ChatProcessor:
 
         return sign_off_message
 
-    def process_chat(self, history_messages: List[Dict[str, Union[str]]], temperature=1, max_tokens=4096, top_p=1, stream=True, stop=None) -> str:
+    def process_chat(self, history_messages: List[Dict[str, Union[str]]], temperature=0.5, max_tokens=4096, top_p=1, stream=True, stop=None) -> str:
         for message in history_messages:
             if message['content'].upper() == "RESET":
                 self.reset_conversation()
@@ -110,15 +110,16 @@ class ChatProcessor:
                                "The tournament is a bit of a joke and an excuse for old Friends to meet. This edition its taking place in Sidzina 735 from 27 till 29 September 2024"
                                "Tournament organizer Mateusz Zięba would like to gather various information's"
                                " (preferences) from his guests."
-                               "REMINDER as most of the gues are Jokers please dont take their responses to seriously, just note them down "
-                               "Please great the user and provide all the necessary info if asked"
-                               "Run the conversation in the way that after you gather all necessary information's you"
+                               "Please great and asure them you are here to help"
+                               "Be helpful"
+                               "don't go straight into asking questions but run the conversation in the way that after you gather all necessary information's you"
                                "which is: "
                                "attending, days_attending, guest_number, guest_names only if many guests, needs_accommodation_help, food_preference, interested_in_top_of_babia_gora, "
                                "IF NOT ATTENDING the only information you should collect is the reason why"
                                "REMINDER  keep in mind that is should be natural, ask the questions one by one and try to introduce a bit of small talk "
                                "save the preferences into db."
                                "DON'T make a tool call until you have all the data"
+                               "AFTER saving the preferences ask the user if you can help him further"
 
                 },
                 *history_messages,
@@ -152,5 +153,5 @@ class ChatProcessor:
 
     def reset_conversation(self):
         self.conversation.messages.all().delete()
-        self.conversation.proposal_saved = False
+        self.conversation.preferences_gathered = False
         self.conversation.save()

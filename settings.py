@@ -14,6 +14,8 @@ import os
 import sys
 import environ
 import google.auth
+from google.cloud import secretmanager
+import io
 # from google.cloud import secretmanager
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
@@ -75,12 +77,12 @@ except google.auth.exceptions.DefaultCredentialsError:
 env_file = os.path.join(BASE_DIR, ".env")
 if os.path.isfile(env_file):
     env.read_env(env_file)
-# elif GCP_PROJECT_ID:
-#     client = secretmanager.SecretManagerServiceClient()
-#     secret_name = 'chat_api_django_settings'
-#     name = f'projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest'
-#     payload = client.access_secret_version(name=name).payload.data.decode("UTF-8")
-#     env.read_env(io.StringIO(payload))
+elif GCP_PROJECT_ID:
+    client = secretmanager.SecretManagerServiceClient()
+    secret_name = 'chat_api_django_settings'
+    name = f'projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest'
+    payload = client.access_secret_version(name=name).payload.data.decode("UTF-8")
+    env.read_env(io.StringIO(payload))
 
 LOGGING = {
     'version': 1,

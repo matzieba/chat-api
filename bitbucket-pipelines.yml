@@ -72,31 +72,8 @@ pipelines:
           name: Deploy to beta
           deployment: staging
           script:
-            - echo ${GOOGLE_CLIENT_SECRET_BETA} > client-secret.json
-            - echo ${FIREBASE_CERT_BETA} > firebase-cert.json
-            - gcloud config set project ${GCP_PROJECT_BETA}
+            - echo ${GOOGLE_CLIENT_SECRET} > client-secret.json
+            - echo ${FIREBASE_CERT} > firebase-cert.json
+            - gcloud config set project ${GCP_PROJECT}
             - gcloud auth activate-service-account --key-file client-secret.json
             - gcloud app deploy app-beta.yaml --quiet --verbosity=error --promote
-      - step:
-          image: google/cloud-sdk
-          name: Deploy to prod
-          deployment: production
-          trigger: manual
-          script:
-            - echo ${GOOGLE_CLIENT_SECRET_PROD} > client-secret.json
-            - echo ${FIREBASE_CERT_PROD} > firebase-cert.json
-            - gcloud config set project ${GCP_PROJECT_PROD}
-            - gcloud auth activate-service-account --key-file client-secret.json
-            - gcloud app deploy app-prod.yaml --quiet --verbosity=error --promote
-    hotfix-*:
-      - step: *build
-      - step:
-          image: google/cloud-sdk
-          name: Deploy to prod
-          deployment: production
-          script:
-            - echo ${GOOGLE_CLIENT_SECRET_PROD} > client-secret.json
-            - echo ${FIREBASE_CERT_PROD} > firebase-cert.json
-            - gcloud config set project ${GCP_PROJECT_PROD}
-            - gcloud auth activate-service-account --key-file client-secret.json
-            - gcloud app deploy app-prod.yaml --quiet --verbosity=error --promote
