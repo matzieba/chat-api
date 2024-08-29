@@ -7,6 +7,32 @@ from chat_api.models.preference import Preference
 
 
 
+
+config = {
+    "prompt_preferences": "You are Barnaby th Butler, the assistant of Sidzina World Series Open Chess Tournament host."
+                               "The tournament is a bit of a joke and an excuse for old Friends to meet. This edition its taking place in Sidzina 735 from 27 till 29 September 2024"
+                               "Tournament organizer Mateusz Zięba would like to gather various information's"
+                               " (preferences) from his guests."
+                               "Please great and asure them you are here to help"
+                               "Be helpful"
+                               "don't go straight into asking questions but run the conversation in the way that after you gather all necessary information's you"
+                               "which is: "
+                               "attending, days_attending, guest_number, guest_names only if many guests, needs_accommodation_help, food_preference, interested_in_top_of_babia_gora, "
+                               "IF NOT ATTENDING the only information you should collect is the reason why"
+                               "REMINDER  keep in mind that is should be natural, ask the questions one by one and try to introduce a bit of small talk "
+                               "save the preferences into db."
+                               "DON'T make a tool call until you have all the data",
+
+
+    "prompt_general":  "You are the assistant of Sidzina World Series Open Chess Tournament host."
+                       "You have already managed to gather the guests preferences, now its small talk time"
+                       "Be proactive and try to have a nice conversation, but if the user don't show will to chat you NEED to respect that "
+                       "ASK the user how could you help"
+                       "Inform the user that there would be infos appearing on the website"
+
+
+}
+
 class ChatProcessor:
     def __init__(self, user_id: int, conversation: Conversation,  model: str = 'llama-3.1-70b-versatile'):
         self.client = Groq()
@@ -31,7 +57,6 @@ class ChatProcessor:
             }
         ]
 
-        # Generate sign-off message
         sign_off_message = self.process_chat(system_message)
 
         return sign_off_message
@@ -88,9 +113,22 @@ class ChatProcessor:
                             "not_attending_reason": {
                                 "type": "string",
                                 "description": "The reason for not attending"
+                            },
+                            "interested_in_triathlon_games": {
+                                    "type": "boolean",
+                                    "description": "We are thinking about adding more games to the Tournament and organize Triathlon. Playing chess, Heroes of Might and Magic and Neuroshima Hex. Does the user think is a good idea?"
+                            },
+                            "has_ideas": {
+                                "type": "boolean",
+                                "description": "Does the user have ideas for activities?"
+                            },
+                            "ideas": {
+                                "type": "array",
+                                "description": "Ideas for activities"
                             }
+
                         },
-                        "required": ["attending", "guest_number",  "needs_accommodation_help", "food_preference"],
+                        "required": ["attending", "guest_number",  "needs_accommodation_help", "food_preference", "interested_in_triathlon_games", "has_ideas"],
                     },
 
                 }
@@ -106,20 +144,7 @@ class ChatProcessor:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are the assistant of Sidzina World Series Open Chess Tournament host."
-                               "The tournament is a bit of a joke and an excuse for old Friends to meet. This edition its taking place in Sidzina 735 from 27 till 29 September 2024"
-                               "Tournament organizer Mateusz Zięba would like to gather various information's"
-                               " (preferences) from his guests."
-                               "Please great and asure them you are here to help"
-                               "Be helpful"
-                               "don't go straight into asking questions but run the conversation in the way that after you gather all necessary information's you"
-                               "which is: "
-                               "attending, days_attending, guest_number, guest_names only if many guests, needs_accommodation_help, food_preference, interested_in_top_of_babia_gora, "
-                               "IF NOT ATTENDING the only information you should collect is the reason why"
-                               "REMINDER  keep in mind that is should be natural, ask the questions one by one and try to introduce a bit of small talk "
-                               "save the preferences into db."
-                               "DON'T make a tool call until you have all the data"
-                               "AFTER saving the preferences ask the user if you can help him further"
+                    "content": config['prompt_general'] if self.conversation.preferences_gathered else config['prompt_preferences']
 
                 },
                 *history_messages,
@@ -143,8 +168,6 @@ class ChatProcessor:
                     function_name = tool_call.function.name
                     function_args = tool_call.function.arguments
                     function_to_call = available_functions[function_name]
-                    if function_name == 'gather_preferences' and self.conversation.preferences_gathered:
-                        continue
                     response += function_to_call(function_args)
 
             response += chunk.choices[0].delta.content or ''

@@ -13,6 +13,9 @@ class Preference(models.Model):
     food_preference = models.CharField(max_length=255, null=True, blank=True)
     interested_in_top_of_babia_gora = models.BooleanField(null=True, blank=True)
     not_attending_reason = models.CharField(max_length=255, null=True, blank=True)
+    interested_in_triathlon_games = models.BooleanField(null=True, blank=True)
+    has_ideas = models.BooleanField(null=True, blank=True)
+    ideas = models.JSONField(null=True, blank=True)
 
     def __str__(self):
         return self.user.username

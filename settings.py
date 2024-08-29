@@ -16,7 +16,7 @@ import environ
 import google.auth
 from google.cloud import secretmanager
 import io
-# from google.cloud import secretmanager
+from google.cloud import secretmanager
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +55,7 @@ DEV_ALLOWED_HOSTS = [s.strip() for s in DEV_ALLOWED_HOSTS]
 ALLOWED_HOSTS = [
     *DEV_ALLOWED_HOSTS,
 ]
+
 # Application definition
 
 INSTALLED_APPS = [
@@ -83,6 +84,29 @@ elif GCP_PROJECT_ID:
     name = f'projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest'
     payload = client.access_secret_version(name=name).payload.data.decode("UTF-8")
     env.read_env(io.StringIO(payload))
+
+GAE_VERSION = env("GAE_VERSION", default="local")
+
+if not LOCAL:
+    APPENGINE_ALLOWED_HOSTS_PREFIXES = ["chat-api-dot-", "chat-api.", ""]
+    APPENGINE_ALLOWED_HOSTS_SUFFIXES = [".ey.r", ""]
+    APPENGINE_ALLOWED_HOSTS_VERSIONLESS = []
+    for prefix in APPENGINE_ALLOWED_HOSTS_PREFIXES:
+        for suffix in APPENGINE_ALLOWED_HOSTS_SUFFIXES:
+            APPENGINE_ALLOWED_HOSTS_VERSIONLESS.append(
+                f"{prefix}{GCP_PROJECT_ID}{suffix}.appspot.com"
+            )
+    VERSIONLESS_ALLOWED_HOSTS = [
+        f".{host}" for host in APPENGINE_ALLOWED_HOSTS_VERSIONLESS
+    ]
+    VERSIONED_ALLOWED_HOSTS = [
+        f".{GAE_VERSION}-dot-{host}" for host in APPENGINE_ALLOWED_HOSTS_VERSIONLESS
+    ]
+    ALLOWED_HOSTS = [
+        *DEV_ALLOWED_HOSTS,
+        *VERSIONLESS_ALLOWED_HOSTS,
+        *VERSIONED_ALLOWED_HOSTS,
+    ]
 
 LOGGING = {
     'version': 1,
@@ -191,7 +215,8 @@ CORS_LOCAL = (
 )
 CORS_ORIGIN_WHITELIST = [
     *CORS_LOCAL,
-    "https://mcp-api.oa.r.appspot.com",
+    "https://chat-api-432810.web.app",
+    "https://chat-api-432810.firebaseapp.com",
 ]
 
 CORS_ALLOW_HEADERS = [
@@ -222,7 +247,7 @@ DATABASES = {
             os.environ.get("CHAT_API_DB_HOST", "0.0.0.0"),
         ),
         'PORT': os.environ.get('CHAT_API_DB_PORT', '5432'),
-        'CONN_MAX_AGE': 60,  # 1 minute
+        'CONN_MAX_AGE': 0,
     }
 }
 

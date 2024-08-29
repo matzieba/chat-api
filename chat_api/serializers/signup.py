@@ -1,18 +1,18 @@
 from rest_framework import serializers
 
+from chat_api.exceptions.user_invitation import UserInvitationDoesNotExistException
+from chat_api.repositories.user_invitation import UserInvitationRepository
+
 
 class SignupSerializer(serializers.Serializer):
     password = serializers.CharField(max_length=1024)
-    repeated_password = serializers.CharField(max_length=1024)
+    repeat_password = serializers.CharField(max_length=1024)
     first_name = serializers.CharField(max_length=1024)
     last_name = serializers.CharField(max_length=1024)
     company = serializers.CharField(max_length=1024, required=False, allow_blank=True)
     phone = serializers.CharField(max_length=1024, required=False, allow_blank=True)
     job_title = serializers.CharField(max_length=1024, required=False, allow_blank=True)
     email = serializers.CharField(max_length=1024)
-    user_invitation_id = serializers.CharField(
-        max_length=1024, required=False, allow_blank=True
-    )
 
     def validate(self, data):
         if "password" and "repeated_password" in data:

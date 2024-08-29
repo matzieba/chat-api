@@ -1,13 +1,13 @@
 definitions:
-  caches:
-    precommit: $HOME/.cache/pre-commit
-  services:
-    postgres:
-      image: postgres
-      environment:
-        POSTGRES_DB: 'chat_api'
-        POSTGRES_USER: 'chat_api'
-        POSTGRES_PASSWORD: 'chat_api'
+#  caches:
+#    precommit: $HOME/.cache/pre-commit
+#  services:
+#    postgres:
+#      image: postgres
+#      environment:
+#        POSTGRES_DB: 'chat_api'
+#        POSTGRES_USER: 'chat_api'
+#        POSTGRES_PASSWORD: 'chat_api'
   steps:
     - step: &build
         image: python:3.9
@@ -50,17 +50,6 @@ definitions:
           - postgres
 
 pipelines:
-  default:
-      - step: *code_quality_check
-      - step: *safety
-      - step: *unit_tests
-
-  branches:
-    develop:
-      - step: *code_quality_check
-      - step: *safety
-      - step: *unit_tests
-
   tags:
     release-*:
       - step: *code_quality_check
@@ -69,11 +58,11 @@ pipelines:
       - step: *unit_tests
       - step:
           image: google/cloud-sdk
-          name: Deploy to beta
+          name: Deploy
           deployment: staging
           script:
             - echo ${GOOGLE_CLIENT_SECRET} > client-secret.json
             - echo ${FIREBASE_CERT} > firebase-cert.json
             - gcloud config set project ${GCP_PROJECT}
             - gcloud auth activate-service-account --key-file client-secret.json
-            - gcloud app deploy app-beta.yaml --quiet --verbosity=error --promote
+            - gcloud app deploy app.yaml --quiet --verbosity=error --promote
