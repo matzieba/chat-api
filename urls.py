@@ -56,6 +56,7 @@ initialize_app()
 urlpatterns = [
     path('admin/', admin.site.urls),
     re_path(r"^chat-api/v1/", include("chat_api.urls")),
+    re_path(r"^chess-api/v1/", include("chess_api.urls")),
     re_path(r"^_ah/warmup", WarmUpView.as_view(), name="warmup"),
 ]
 
@@ -63,6 +64,6 @@ urlpatterns.extend(
     extend_with_documentation(
         re_path(r"^chat-api/v1/", include("chat_api.urls")),
         title="chat_api",
-        description=f"Behold My Awesome Project!",
+        description=f"chat-api",
     )
 )

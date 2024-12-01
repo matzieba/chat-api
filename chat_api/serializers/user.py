@@ -5,10 +5,13 @@ from chat_api.clients.firebase import FirebaseClient
 from chat_api.models import User
 from chat_api.models.conversation import Conversation
 from chat_api.serializers.company import CompanySerializer
+from chess_api.models import ChessGame
 from django.db.models import ObjectDoesNotExist
+import chess
 
 class UserSerializer(WritableNestedModelSerializer):
     chat_id = SerializerMethodField()
+    game_id = SerializerMethodField()
     class Meta:
         model = User
         read_only_fields = ["id", "firebase_uid"]
@@ -23,6 +26,7 @@ class UserSerializer(WritableNestedModelSerializer):
             "job_title",
             "profile_picture",
             "chat_id",
+            "game_id",
         ]
 
     company = CompanySerializer(required=False, allow_null=True)
@@ -33,6 +37,13 @@ class UserSerializer(WritableNestedModelSerializer):
         except ObjectDoesNotExist:
             conversation = Conversation.objects.create(user=obj)
         return conversation.id
+
+    def get_game_id(self, obj):
+        try:
+            game = obj.games.get()
+        except ObjectDoesNotExist:
+            game = ChessGame.objects.create(human_player=obj, board_state=chess.Board().fen(), moves=[])
+        return game.game_id
 
     def create(self, validated_data):
         if validated_data.get("email") and not validated_data.get("firebase_uid"):

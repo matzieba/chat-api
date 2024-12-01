@@ -14,7 +14,6 @@ import os
 import sys
 import environ
 import google.auth
-from google.cloud import secretmanager
 import io
 from google.cloud import secretmanager
 
@@ -66,6 +65,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'chat_api',
+    'chess_api',
     # TODO CHANGE TO SPECTACULAR
     'drf_yasg',
     'rest_framework',
