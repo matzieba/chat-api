@@ -42,7 +42,7 @@ class UserSerializer(WritableNestedModelSerializer):
         try:
             game = obj.games.get()
         except ObjectDoesNotExist:
-            game = ChessGame.objects.create(human_player=obj, board_state=chess.Board().fen(), moves=[])
+            game = ChessGame.objects.create(human_player=obj, board_state=chess.Board().fen(), moves=[], game_status='ongoing')
         return game.game_id
 
     def create(self, validated_data):
