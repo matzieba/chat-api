@@ -6,6 +6,8 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework import serializers
 import chess
+
+from chat_api.models import User
 from chess_api.models import ChessGame
 
 class ChessGameSerializer(serializers.ModelSerializer):
@@ -13,13 +15,29 @@ class ChessGameSerializer(serializers.ModelSerializer):
         model = ChessGame
         fields = ['game_id', 'board_state', 'moves', 'game_status', 'created_at', 'current_player']
 
+class ChessGameCreateSerializer(serializers.ModelSerializer):
+    human_player = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=True)
+    game_id = serializers.IntegerField(read_only=True)
+    class Meta:
+        model = ChessGame
+        fields = ['human_player', 'game_id']
+
+    def create(self, validated_data):
+        return ChessGame.objects.create(**validated_data)
+
 class GameViewSet(viewsets.ModelViewSet):
     class Meta:
         model = ChessGame
         fields = "__all__"
 
     queryset = ChessGame.objects.all()
-    serializer_class = ChessGameSerializer
+
+    def get_serializer_class(self):
+        if self.action in ['list', 'retrieve']:
+            return ChessGameSerializer
+        elif self.action == 'create':
+            return ChessGameCreateSerializer
+        return ChessGameSerializer
 
     def post(self, request, *args, **kwargs):
         try:
@@ -50,7 +68,7 @@ class GameViewSet(viewsets.ModelViewSet):
         game.game_status = self.get_game_status(board)
         game.save()
 
-        serializer = ChessGameSerializer(game)
+        serializer = self.get_serializer(game)
         return Response(serializer.data)
 
     @staticmethod
