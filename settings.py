@@ -66,6 +66,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'chat_api',
     'chess_api',
+    'chess_engine',
     # TODO CHANGE TO SPECTACULAR
     'drf_yasg',
     'rest_framework',
