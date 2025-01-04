@@ -1,69 +1,72 @@
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import layers
 
+import tensorflow as tf
+from keras.src.optimizers import Adam
+from tensorflow.keras import layers
 from chess_engine.engine.utils import NUM_MOVES
 
 
 def create_model():
-    # Input layer: Sequence of token IDs
-    input_seq = tf.keras.Input(shape=(64,), dtype=tf.int32, name='input_seq')
-    # Positional encoding
-    embedding_dim = 64
-    vocab_size = 13  # 12 pieces + empty square
+    # Input layer: Board representation as 8x8x14 tensor
+    input_board = tf.keras.Input(shape=(8, 8, 14), dtype=tf.float32, name='input_board')
 
-    # Token embedding
-    token_embedding = layers.Embedding(input_dim=vocab_size, output_dim=embedding_dim, name='token_embedding')(input_seq)
+    # Initial convolutional layer
+    x = layers.Conv2D(filters=256, kernel_size=3, padding='same', activation='relu')(input_board)
 
-    # Add positional encoding
-    position_indices = tf.range(64)
-    position_embedding = layers.Embedding(input_dim=64, output_dim=embedding_dim, name='position_embedding')(position_indices)
-    x = token_embedding + position_embedding
+    # Residual blocks
+    for _ in range(20):  # Increase depth as necessary
+        residual = x
+        x = layers.Conv2D(filters=256, kernel_size=3, padding='same')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Activation('relu')(x)
+        x = layers.Conv2D(filters=256, kernel_size=3, padding='same')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.add([x, residual])
+        x = layers.Activation('relu')(x)
 
-    # Transformer Encoder
-    num_layers = 4
-    num_heads = 8
-    ffn_dim = 256
-    dropout_rate = 0.1
-
-    for _ in range(num_layers):
-        # Multi-head attention
-        attn_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embedding_dim)(x, x)
-        attn_output = layers.Dropout(dropout_rate)(attn_output)
-        x = layers.LayerNormalization(epsilon=1e-6)(x + attn_output)
-
-        # Feed-forward network
-        ffn = layers.Dense(ffn_dim, activation='relu')(x)
-        ffn_output = layers.Dense(embedding_dim)(ffn)
-        ffn_output = layers.Dropout(dropout_rate)(ffn_output)
-        x = layers.LayerNormalization(epsilon=1e-6)(x + ffn_output)
-
-    # Flatten the output
-    x = layers.Flatten()(x)
-
-    # Final dense layers
-    x = layers.Dense(512, activation='relu')(x)
-    x = layers.Dropout(dropout_rate)(x)
-    x = layers.Dense(256, activation='relu')(x)
-    x = layers.Dropout(dropout_rate)(x)
-
-    # Output layer (logits)
-    logits = layers.Dense(NUM_MOVES, name='logits')(x)
+    # Policy head
+    policy_conv = layers.Conv2D(filters=2, kernel_size=1, activation='relu')(x)
+    policy_flat = layers.Flatten()(policy_conv)
+    logits = layers.Dense(NUM_MOVES, name='logits')(policy_flat)
 
     # Masking illegal moves
     mask_input = tf.keras.Input(shape=(NUM_MOVES,), name='mask_input')
     negative_inf = -1e9
     masked_logits = logits + (1.0 - mask_input) * negative_inf
 
-    # Apply softmax to masked logits
-    output = tf.keras.layers.Softmax(name='output')(masked_logits)
+    # Softmax output
+    policy_output = layers.Softmax(name='policy_output')(masked_logits)
 
-    # Create the model
-    model = tf.keras.Model(inputs=[input_seq, mask_input], outputs=output)
+    # Value head
+    value_conv = layers.Conv2D(filters=1, kernel_size=1, activation='relu')(x)
+    value_flat = layers.Flatten()(value_conv)
+    value_dense = layers.Dense(256, activation='relu')(value_flat)
+    value_output = layers.Dense(1, activation='tanh', name='value_output')(value_dense)
 
-    # Compile the model
-    model.compile(optimizer=Adam(learning_rate=1e-4), loss='sparse_categorical_crossentropy')
+    # Create model
+    model = tf.keras.Model(inputs=[input_board, mask_input], outputs=[policy_output, value_output])
+    model.compile(
+        optimizer=Adam(learning_rate=tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=1e-3,
+            decay_steps=100000
+        )),
+        loss={
+            'policy_output': 'sparse_categorical_crossentropy',
+            'value_output': 'mean_squared_error'
+        },
+        loss_weights={
+            'policy_output': 1.0,
+            'value_output': 1.0  # Adjust weight as needed
+        },
+        metrics={
+            'policy_output': [
+                tf.keras.metrics.SparseCategoricalAccuracy(name='accuracy'),
+                tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name='top_5_accuracy')
+            ],
+            # Optionally, add metrics for 'value_output' if desired
+        }
+    )
+
     return model
 
 def policy_gradient(model, optimizer, states, actions, rewards, gamma=0.99):

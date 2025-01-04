@@ -44,7 +44,6 @@ class UserAdminForm(forms.ModelForm):
             "email",
             "status",
             "job_title",
-            "profile_picture",
             "is_staff",
             "is_superuser",
             "firebase_uid",

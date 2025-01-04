@@ -24,7 +24,6 @@ class UserSerializer(WritableNestedModelSerializer):
             "firebase_uid",
             "company",
             "job_title",
-            "profile_picture",
             "chat_id",
             "game_id",
         ]

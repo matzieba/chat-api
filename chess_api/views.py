@@ -1,31 +1,28 @@
-import pickle
-import random
 import numpy as np
-import tensorflow as tf
+# import tensorflow as tf
 from django.db import transaction
 from rest_framework import viewsets, status, serializers
 from rest_framework.response import Response
 import chess
+import requests
+
+import settings
 from chat_api.models import User
 from chess_api.models import ChessGame
+# from chess_engine.engine.utils import initialize_move_encoding, board_to_planes, encode_move, get_legal_moves_mask, NUM_MOVES
 
-
-# Constants
-NUM_SQUARES = 64
-NUM_PROMOTION_OPTIONS = 5  # No promotion + 4 promotion pieces
-PROMOTION_PIECES = [None, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
-num_moves = NUM_SQUARES * NUM_SQUARES * NUM_PROMOTION_OPTIONS  # 64 * 64 * 5 = 20,480
 
 # Load your trained model
-MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/models/best_trained_transformer_model.keras"
-model = tf.keras.models.load_model(MODEL_PATH)
+MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/best_trained_model_cnn.keras"
+# model = tf.keras.models.load_model(MODEL_PATH)
 
+# Initialize move encoding
+# initialize_move_encoding()
 
 class ChessGameSerializer(serializers.ModelSerializer):
     class Meta:
         model = ChessGame
         fields = ['game_id', 'board_state', 'moves', 'game_status', 'created_at', 'current_player']
-
 
 class ChessGameCreateSerializer(serializers.ModelSerializer):
     human_player = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=True)
@@ -37,7 +34,6 @@ class ChessGameCreateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         return ChessGame.objects.create(**validated_data)
-
 
 class GameViewSet(viewsets.ModelViewSet):
     model = ChessGame
@@ -58,7 +54,7 @@ class GameViewSet(viewsets.ModelViewSet):
             return Response({"error": "Game not found"}, status=status.HTTP_404_NOT_FOUND)
 
         player = request.data.get("player", None)
-        move = request.data.get("move", None)
+        move_input = request.data.get("move", None)
 
         if game.current_player != player:
             return Response({"error": f"It is {game.current_player}'s turn."}, status=status.HTTP_400_BAD_REQUEST)
@@ -66,36 +62,37 @@ class GameViewSet(viewsets.ModelViewSet):
         board = chess.Board(game.board_state)
 
         if player == "white":
-            if not self.make_player_move(board, move):
+            chess_move = self.make_player_move(board, move_input)
+            if not chess_move:
                 return Response({"error": "Invalid move"}, status=status.HTTP_400_BAD_REQUEST)
+            move = chess_move  # Use the chess.Move object
             game.current_player = 'black'
         elif player == "black":
             if board.is_game_over():
                 game.game_status = self.get_game_status(board)
             else:
-                move = self.get_model_move(board)
+                move = self.get_ai_move_from_service(board)  # move is a chess.Move object
                 board.push(move)
                 game.current_player = 'white'
 
         # Update game state
         game.board_state = board.fen()
-        game.moves.append(move)
+        game.moves.append(move.uci())  # Now 'move' is always a chess.Move object
         game.game_status = self.get_game_status(board)
         game.save()
-
         serializer = self.get_serializer(game)
         return Response(serializer.data)
 
     @staticmethod
-    def make_player_move(board, move):
+    def make_player_move(board, move_str):
         try:
-            chess_move = chess.Move.from_uci(move)
+            chess_move = chess.Move.from_uci(move_str)
             if not board.is_legal(chess_move):
-                return False
+                return None
             board.push(chess_move)
-            return True
+            return chess_move  # Return the chess.Move object
         except ValueError:
-            return False
+            return None
 
     @staticmethod
     def get_game_status(board):
@@ -109,81 +106,67 @@ class GameViewSet(viewsets.ModelViewSet):
             return "draw"
         return "ongoing"
 
-    def get_model_move(self, board):
-        # Use convert_board_to_sequence to get the input_seq of shape (64,)
-        state = convert_board_to_sequence(board)
+    # def get_model_move(self, board):
+    #     # Use board_to_planes to get the input_board of shape (8, 8, 14)
+    #     state = board_to_planes(board)  # Returns shape (8, 8, 14)
+    #
+    #     # Generate the mask_input
+    #     mask = get_legal_moves_mask(board)
+    #
+    #     # Expand dimensions to add batch size (1)
+    #     state_input = np.expand_dims(state, axis=0)  # Shape: (1, 8, 8, 14)
+    #     mask_input = np.expand_dims(mask, axis=0)    # Shape: (1, NUM_MOVES)
+    #
+    #     # Prepare inputs as a dictionary
+    #     inputs = {'input_board': state_input, 'mask_input': mask_input}
+    #
+    #     # Get the output probabilities
+    #     model_outputs = model.predict(inputs, verbose=0)
+    #     policy_output = model_outputs[0]  # Get the first output (policy)
+    #     output_probs = policy_output.ravel()
+    #
+    #     # Now, select the move with the highest probability among legal moves
+    #     legal_moves = list(board.legal_moves)
+    #     valid_moves = []
+    #     valid_indices = []
+    #     for move in legal_moves:
+    #         try:
+    #             action_index = encode_move(move)
+    #             valid_moves.append(move)
+    #             valid_indices.append(action_index)
+    #         except (ValueError, IndexError):
+    #             continue
+    #
+    #     # Get probabilities for valid moves
+    #     valid_probs = output_probs[valid_indices]
+    #     best_index = np.argmax(valid_probs)
+    #     best_move = valid_moves[best_index]
+    #     return best_move
 
-        # Generate the mask_input
-        mask = get_legal_moves_mask(board)
-
-        # Expand dimensions to add batch size (1)
-        state_input = np.expand_dims(state, axis=0)  # Shape: (1, 64)
-        mask_input = np.expand_dims(mask, axis=0)  # Shape: (1, num_moves)
-
-        # Prepare inputs as a dictionary
-        inputs = {'input_seq': state_input, 'mask_input': mask_input}
-
-        # Get the output probabilities
-        output_probs = model.predict(inputs, verbose=0).ravel()
-
-        # Now, select the move with the highest probability among legal moves
-        legal_moves = list(board.legal_moves)
-        valid_moves = []
-        valid_indices = []
-        for move in legal_moves:
-            try:
-                action_index = encode_move(move)
-                valid_moves.append(move)
-                valid_indices.append(action_index)
-            except (ValueError, IndexError):
-                continue
-
-        # Get probabilities for valid moves
-        valid_probs = output_probs[valid_indices]
-        best_index = np.argmax(valid_probs)
-        best_move = valid_moves[best_index]
-        return best_move
-
-
-# Helper Functions
-
-def encode_move(move):
-    from_square = move.from_square
-    to_square = move.to_square
-    promotion = move.promotion
-    # Adjust promotion index if promotion
-    if promotion:
-        promotion_index = PROMOTION_PIECES.index(promotion)
-    else:
-        promotion_index = 0  # No promotion is at index 0
-    action_index = (from_square * NUM_SQUARES * NUM_PROMOTION_OPTIONS) + \
-                   (to_square * NUM_PROMOTION_OPTIONS) + \
-                   promotion_index
-    return action_index
-
-
-def convert_board_to_sequence(board):
-    piece_to_id = {
-        None: 0,  # Empty square
-        'P': 1, 'N': 2, 'B': 3, 'R': 4, 'Q': 5, 'K': 6,
-        'p': 7, 'n': 8, 'b': 9, 'r': 10, 'q': 11, 'k': 12,
-    }
-    # Initialize sequence with 64 tokens (one for each square)
-    sequence = np.zeros(64, dtype=np.int32)
-    for idx in range(64):
-        piece = board.piece_at(idx)
-        piece_symbol = piece.symbol() if piece else None
-        token_id = piece_to_id[piece_symbol]
-        sequence[idx] = token_id
-    return sequence
-
-
-def get_legal_moves_mask(board):
-    mask = np.zeros(num_moves, dtype=np.float32)
-    for move in board.legal_moves:
+    def get_ai_move_from_service(self, board):
+        """ Make a POST request to the tf_service to obtain the AI move and convert it to a chess.Move object. """
+        tf_service_url = settings.TF_SERVICE_URL  # e.g., 'http://tf_service:8000'
+        endpoint = f"{tf_service_url}/predict-move"
+        payload = {"fen": board.fen()}
         try:
-            action_index = encode_move(move)
-            mask[action_index] = 1.0
-        except (ValueError, IndexError):
-            pass
-    return mask
+            response = requests.post(endpoint, json=payload, timeout=5)
+        except requests.exceptions.RequestException as e:
+            # Handle request exceptions
+            print(f"Failed to connect to AI service: {e}")
+            return None
+
+        if response.status_code == 200:
+            best_move_uci = response.json().get("best_move")
+            if best_move_uci:
+                try:
+                    move = chess.Move.from_uci(best_move_uci)
+                    return move  # Return the chess.Move object
+                except ValueError:
+                    print(f"Invalid move format received from AI service: {best_move_uci}")
+                    return None
+            else:
+                print("AI service did not return a move.")
+                return None
+        else:
+            print(f"AI service returned an error: {response.status_code} - {response.text}")
+            return None

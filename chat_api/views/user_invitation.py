@@ -6,7 +6,6 @@ from chat_api.serializers.user_invitation import (
     CreateUserInvitationSerializer,
     UserInvitationSerializer,
 )
-from chat_api.services.email import EmailService
 from chat_api_auth.django_auth.authentication import ChatApiDjangoAuthenticationToken
 
 
@@ -28,7 +27,6 @@ class UserInvitationViewSet(
         )
         invitation.save()
 
-        EmailService().send_user_invitation_email(invitation)
         return Response(status=201, data={"invitation_id": invitation.id})
 
     def retrieve(self, request, *args, **kwargs):

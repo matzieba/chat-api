@@ -36,7 +36,6 @@ class Migration(migrations.Migration):
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
                 ('job_title', models.CharField(blank=True, max_length=1024, null=True)),
-                ('profile_picture', models.ImageField(blank=True, null=True, upload_to='user_profile_picture')),
             ],
             options={
                 'verbose_name': 'user',

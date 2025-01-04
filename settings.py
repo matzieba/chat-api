@@ -13,9 +13,7 @@ import json
 import os
 import sys
 import environ
-import google.auth
 import io
-from google.cloud import secretmanager
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +50,7 @@ DEV_ALLOWED_HOSTS = os.environ.get("MCP_API_DEV_ALLOWED_HOSTS", INTERNAL_IPS).sp
 DEV_ALLOWED_HOSTS = [s.strip() for s in DEV_ALLOWED_HOSTS]
 
 ALLOWED_HOSTS = [
-    *DEV_ALLOWED_HOSTS,
+    "*"
 ]
 
 # Application definition
@@ -66,48 +64,11 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'chat_api',
     'chess_api',
-    'chess_engine',
+    # 'chess_engine',
     # TODO CHANGE TO SPECTACULAR
     'drf_yasg',
     'rest_framework',
 ]
-
-try:
-    gcp_credentials, GCP_PROJECT_ID = google.auth.default()
-except google.auth.exceptions.DefaultCredentialsError:
-    GCP_PROJECT_ID = None
-env_file = os.path.join(BASE_DIR, ".env")
-if os.path.isfile(env_file):
-    env.read_env(env_file)
-elif GCP_PROJECT_ID:
-    client = secretmanager.SecretManagerServiceClient()
-    secret_name = 'chat_api_django_settings'
-    name = f'projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest'
-    payload = client.access_secret_version(name=name).payload.data.decode("UTF-8")
-    env.read_env(io.StringIO(payload))
-
-GAE_VERSION = env("GAE_VERSION", default="local")
-
-if not LOCAL:
-    APPENGINE_ALLOWED_HOSTS_PREFIXES = ["chat-api-dot-", "chat-api.", ""]
-    APPENGINE_ALLOWED_HOSTS_SUFFIXES = [".ey.r", ""]
-    APPENGINE_ALLOWED_HOSTS_VERSIONLESS = []
-    for prefix in APPENGINE_ALLOWED_HOSTS_PREFIXES:
-        for suffix in APPENGINE_ALLOWED_HOSTS_SUFFIXES:
-            APPENGINE_ALLOWED_HOSTS_VERSIONLESS.append(
-                f"{prefix}{GCP_PROJECT_ID}{suffix}.appspot.com"
-            )
-    VERSIONLESS_ALLOWED_HOSTS = [
-        f".{host}" for host in APPENGINE_ALLOWED_HOSTS_VERSIONLESS
-    ]
-    VERSIONED_ALLOWED_HOSTS = [
-        f".{GAE_VERSION}-dot-{host}" for host in APPENGINE_ALLOWED_HOSTS_VERSIONLESS
-    ]
-    ALLOWED_HOSTS = [
-        *DEV_ALLOWED_HOSTS,
-        *VERSIONLESS_ALLOWED_HOSTS,
-        *VERSIONED_ALLOWED_HOSTS,
-    ]
 
 LOGGING = {
     'version': 1,
@@ -146,26 +107,6 @@ LOGGING = {
         }
     }
 }
-
-if not LOCAL:
-    from google.cloud import logging as google_logging
-
-    client = google_logging.Client()
-    client.setup_logging()
-
-    LOGGING['handlers']['stackdriver'] = {
-        'class': 'chat_api.helpers.custom_logging_handler.CustomErrorReportingGCloudHandler',
-        'client': client
-    }
-
-    LOGGING['loggers']['chat_api'] = {
-            'handlers': ['stackdriver'],
-            'level': 'INFO',
-    }
-    LOGGING['loggers']['django'] = {
-            'handlers': ['stackdriver'],
-            'level': 'INFO',
-    }
 
 
 DEFAULT_RENDERER_CLASSES = (
@@ -243,10 +184,7 @@ DATABASES = {
         'NAME': os.environ.get('CHAT_API_DB_NAME', 'chat_api'),
         'USER': os.environ.get('CHAT_API_DB_USER', 'chat_api'),
         'PASSWORD': os.environ.get('CHAT_API_DB_PASSWORD', 'chat_api'),
-        "HOST": os.environ.get(
-            "CHAT_API_DB_GCP_HOST",
-            os.environ.get("CHAT_API_DB_HOST", "0.0.0.0"),
-        ),
+        "HOST": 'db',
         'PORT': os.environ.get('CHAT_API_DB_PORT', '5432'),
         'CONN_MAX_AGE': 0,
     }
@@ -303,3 +241,6 @@ SENDGRID_CONFIG = {
         "INVITATION": os.environ.get("SENDGRID_INVITATION_TEMPLATE_ID"),
     },
 }
+
+TF_SERVICE_URL = "http://tf_service:8000"
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')

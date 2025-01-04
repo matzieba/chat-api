@@ -3,58 +3,107 @@ import chess
 import chess.pgn
 import numpy as np
 import tensorflow as tf
-from collections import Counter
-from sklearn.utils import class_weight
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, Callback
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, Callback
 
-from utils import NUM_SQUARES, NUM_PROMOTION_OPTIONS, NUM_MOVES
-from utils import encode_move, convert_board_to_sequence, get_legal_moves_mask
+# Adjust import to match your model’s location:
+from chess_engine.engine.small_model.model import create_small_chess_model
+from utils import encode_move, board_to_planes, get_legal_moves_mask, NUM_MOVES
 
 class TrainingProgressCallback(Callback):
     def on_epoch_end(self, epoch, logs=None):
-        print(f"Epoch {epoch + 1}: loss = {logs['loss']:.4f}, accuracy = {logs['accuracy']:.4f}, "
-              f"val_loss = {logs['val_loss']:.4f}, val_accuracy = {logs['val_accuracy']:.4f}")
+        logs = logs or {}
+        print(f"Epoch {epoch + 1}: loss = {logs.get('loss', 0):.4f}, "
+              f"policy_accuracy = {logs.get('policy_output_accuracy', 0):.4f}, "
+              f"val_loss = {logs.get('val_loss', 0):.4f}, "
+              f"val_policy_accuracy = {logs.get('val_policy_output_accuracy', 0):.4f}")
 
 def data_generator(file_path, batch_size=256, max_games=None, is_training=True):
+    """
+    Yields input_dict, output_dict in a form suitable for
+    model.compile(loss={"policy_output": "categorical_crossentropy", ...}).
+    The policy is returned as a one-hot vector of shape (NUM_MOVES,).
+    """
     def generator():
-        with open(file_path, "r") as pgn_file:
-            game_counter = 0
-            while True:
-                game = chess.pgn.read_game(pgn_file)
-                if game is None:
-                    break  # End of file reached
+        try:
+            with open(file_path, "r") as pgn_file:
+                game_counter = 0
+                while True:
+                    game = chess.pgn.read_game(pgn_file)
+                    if game is None:
+                        break  # End of file reached
 
-                # Skip some games for validation
-                if is_training and random.random() < 0.1:
-                    continue  # Skip this game for training set
-                if not is_training and random.random() >= 0.1:
-                    continue  # Skip this game for validation set
+                    # Control which games go to training vs validation:
+                    if is_training and random.random() < 0.1:
+                        continue  # Skip this game for training set
+                    if not is_training and random.random() >= 0.1:
+                        continue  # Skip this game for validation set
 
-                board = game.board()
-                for move in game.mainline_moves():
-                    state = convert_board_to_sequence(board)
-                    try:
-                        action_index = encode_move(move)
-                    except (ValueError, IndexError):
+                    result = game.headers.get("Result", "1/2-1/2")
+                    if result == "1-0":
+                        value_label = 1.0
+                    elif result == "0-1":
+                        value_label = -1.0
+                    else:
+                        value_label = 0.0
+
+                    board = game.board()
+
+                    for move in game.mainline_moves():
+                        state = board_to_planes(board)
+
+                        try:
+                            action_index = encode_move(move)
+                        except (ValueError, IndexError) as e:
+                            # If the move cannot be encoded properly, skip it
+                            print(f"Skipping move due to encoding error: {e}")
+                            board.push(move)
+                            continue
+
+                        # Create one-hot for policy
+                        policy_one_hot = np.zeros((NUM_MOVES,), dtype=np.float32)
+                        policy_one_hot[action_index] = 1.0
+
+                        # Get the legal moves mask
+                        mask = get_legal_moves_mask(board).astype(np.float32)
+
+                        # Yield the batch element
+                        yield (
+                            {
+                                'input_board': state,
+                                'mask_input': mask,
+                            },
+                            {
+                                'policy_output': policy_one_hot,
+                                'value_output': value_label,
+                            },
+                        )
+
                         board.push(move)
-                        continue
-                    # Get legal moves mask
-                    mask = get_legal_moves_mask(board)
-                    yield {'input_seq': state, 'mask_input': mask.astype(np.float32)}, action_index
-                    board.push(move)
-                game_counter += 1
-                if max_games and game_counter >= max_games:
-                    break  # Stop after max_games
+
+                    game_counter += 1
+                    if max_games and game_counter >= max_games:
+                        break
+        except Exception as e:
+            print(f"Exception in data generator: {e}")
+            raise e
+
     return generator
 
 def create_dataset(file_path, batch_size, max_games, is_training):
-    output_types = ({'input_seq': tf.int32, 'mask_input': tf.float32}, tf.int32)
-    output_shapes = ({'input_seq': (64,), 'mask_input': (NUM_MOVES,)}, ())
+    output_types = (
+        {'input_board': tf.float32, 'mask_input': tf.float32},
+        {'policy_output': tf.float32, 'value_output': tf.float32},
+    )
+    output_shapes = (
+        {'input_board': (8, 8, 14), 'mask_input': (NUM_MOVES,)},
+        {'policy_output': (NUM_MOVES,), 'value_output': ()},
+    )
     dataset = tf.data.Dataset.from_generator(
         data_generator(file_path, batch_size, max_games, is_training),
         output_types=output_types,
         output_shapes=output_shapes
     )
+
     if is_training:
         dataset = dataset.shuffle(buffer_size=10000)
     dataset = dataset.batch(batch_size)
@@ -66,12 +115,10 @@ def train_supervised(file_path, max_games=None, existing_model_path=None):
     if existing_model_path:
         print(f"Loading existing model from {existing_model_path}...")
         model = tf.keras.models.load_model(existing_model_path)
-        if model.output_shape[-1] != NUM_MOVES:
-            raise ValueError(f"Number of moves ({NUM_MOVES}) does not match the model's output layer size ({model.output_shape[-1]}).")
     else:
         print("Creating new model...")
-        from model import create_model  # Ensure this import works correctly
-        model = create_model()
+        # Make sure to import or define create_small_chess_model in your environment
+        model = create_small_chess_model()
 
     # Create datasets
     batch_size = 64
@@ -81,17 +128,21 @@ def train_supervised(file_path, max_games=None, existing_model_path=None):
     val_dataset = create_dataset(file_path, batch_size, max_games, is_training=False)
 
     # Callbacks
-    checkpoint = ModelCheckpoint('best_transformer_model.keras', monitor='val_accuracy', save_best_only=True, mode='max')
-    early_stopping = EarlyStopping(monitor='val_accuracy', patience=7, restore_best_weights=True)
-    reduce_lr = ReduceLROnPlateau(monitor='val_accuracy', factor=0.5, patience=3, min_lr=1e-6, verbose=1)
+    checkpoint = ModelCheckpoint('best_trained_model.keras',
+                                 monitor='val_policy_output_accuracy',  # matches model metric name
+                                 save_best_only=True, mode='max')
+    early_stopping = EarlyStopping(monitor='val_policy_output_accuracy',
+                                   mode='max', patience=10,
+                                   restore_best_weights=True)
     training_progress = TrainingProgressCallback()
-    callbacks = [checkpoint, early_stopping, reduce_lr, training_progress]
+
+    callbacks = [checkpoint, early_stopping, training_progress]
 
     print("Starting model training...")
-    # Train model
-    epochs = 5  # Adjust as needed
-    steps_per_epoch = 15  # Adjust as needed
+    epochs = 40  # Adjust as needed
+    steps_per_epoch = 500  # Adjust as needed
     validation_steps = steps_per_epoch // 10
+
     history = model.fit(
         train_dataset,
         validation_data=val_dataset,
@@ -103,14 +154,15 @@ def train_supervised(file_path, max_games=None, existing_model_path=None):
 
     print("Training completed.")
     # Save the model to a file
-    model_save_path = 'best_trained_transformer_model.keras'
+    model_save_path = 'best_trained_model_small_cnn_l2.keras'
     model.save(model_save_path, include_optimizer=True)
     print(f"Best model saved to {model_save_path}")
     return model
 
-# Start training
-model = train_supervised(
-    '/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/games_data/lichess_elite_2020-06.pgn',
-    max_games=20,
-    existing_model_path="/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/models/best_trained_transformer_model.keras"
-)
+# Example usage
+if __name__ == "__main__":
+    model = train_supervised(
+        "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/games_data/lichess_elite_2020-07.pgn",
+        max_games=30000,
+        existing_model_path=None,  # or a path to an existing model
+    )

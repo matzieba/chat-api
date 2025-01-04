@@ -5,7 +5,7 @@ from tensorflow.keras.optimizers import Adam
 
 from environment import ChessEnvironment
 from utils import NUM_SQUARES, NUM_PROMOTION_OPTIONS, NUM_MOVES
-from utils import encode_move, decode_action, convert_board_to_sequence, get_legal_moves_mask
+from utils import encode_move, decode_action, board_to_planes, get_legal_moves_mask
 from model import create_model
 
 def compute_returns(rewards, gamma=0.99):
@@ -18,24 +18,35 @@ def compute_returns(rewards, gamma=0.99):
     returns = (returns - np.mean(returns)) / (np.std(returns) + 1e-8)
     return returns
 
-def policy_gradient_update(model, optimizer, states, masks, actions, returns):
-    actions = np.array(actions)
-    returns = np.array(returns)
+def policy_value_update(model, optimizer, states, masks, actions, returns):
+    # Convert to tensors
+    states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
+    masks_tensor = tf.convert_to_tensor(masks, dtype=tf.float32)
+    actions_tensor = tf.convert_to_tensor(actions, dtype=tf.int32)
+    returns_tensor = tf.convert_to_tensor(returns, dtype=tf.float32)
+
     with tf.GradientTape() as tape:
-        # Get probabilities for all actions given the states
-        logits = model({'input_seq': states, 'mask_input': masks}, training=True)
-        log_probs = tf.math.log(logits + 1e-8)  # Add epsilon to avoid log(0)
+        # Forward pass
+        policy_outputs, value_outputs = model({'input_board': states_tensor, 'mask_input': masks_tensor}, training=True)
+        value_outputs = tf.squeeze(value_outputs, axis=1)
 
-        # Gather the log probabilities corresponding to the actions taken
-        actions_indices = tf.stack([tf.range(len(actions)), actions], axis=1)
-        selected_log_probs = tf.gather_nd(log_probs, actions_indices)
+        # Compute advantages
+        advantages = returns_tensor - value_outputs
 
-        # Compute the policy loss
-        loss = -tf.reduce_mean(selected_log_probs * returns)
+        # Compute policy loss
+        action_masks = tf.one_hot(actions_tensor, NUM_MOVES)
+        log_probs = tf.math.log(policy_outputs + 1e-8)
+        selected_log_probs = tf.reduce_sum(log_probs * action_masks, axis=1)
+        policy_loss = -tf.reduce_mean(selected_log_probs * advantages)
 
-    # Compute gradients
-    grads = tape.gradient(loss, model.trainable_variables)
-    # Apply gradients
+        # Compute value loss
+        value_loss = tf.reduce_mean(tf.square(advantages))
+
+        # Total loss
+        total_loss = policy_loss + 0.01 * value_loss  # Adjust value loss weight as needed
+
+    # Compute gradients and apply them
+    grads = tape.gradient(total_loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
 def train(episodes, save_path, existing_model_path=None):
@@ -47,11 +58,8 @@ def train(episodes, save_path, existing_model_path=None):
         model = create_model()
         optimizer = model.optimizer  # Use the optimizer from the compiled model
         print("Initialized a new model.")
-
+    opponent_model = tf.keras.models.load_model("/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/best_trained_model_cnn_opponent.keras")
     env = ChessEnvironment(agent_color=chess.WHITE)
-    opponent_model = tf.keras.models.clone_model(model)
-    opponent_model.set_weights(model.get_weights())
-    opponent_model.compile(optimizer=Adam(learning_rate=1e-4))  # Recompile to initialize optimizer
 
     for episode in range(episodes):
         # Initialize the environment and storage arrays
@@ -61,14 +69,16 @@ def train(episodes, save_path, existing_model_path=None):
 
         while not done:
             # Agent's move
-            state_input = convert_board_to_sequence(state)
+            state_input = board_to_planes(state)
             mask = get_legal_moves_mask(state)
 
-            # Predict action probabilities
+            # Predict action probabilities and value
             state_input_expanded = np.expand_dims(state_input, axis=0)
             mask_input_expanded = np.expand_dims(mask, axis=0)
-            model_inputs = {'input_seq': state_input_expanded, 'mask_input': mask_input_expanded}
-            action_probs = model.predict(model_inputs, verbose=0).ravel()
+            model_inputs = {'input_board': state_input_expanded, 'mask_input': mask_input_expanded}
+            policy_output, value_output = model.predict(model_inputs, verbose=0)
+            action_probs = policy_output.ravel()
+            state_value = value_output[0][0]
 
             # Choose an action
             action_index = np.random.choice(NUM_MOVES, p=action_probs)
@@ -76,20 +86,6 @@ def train(episodes, save_path, existing_model_path=None):
 
             # Agent performs the move
             next_state, reward, done, info = env.move(action_move)
-
-            # Check if the game is over after the agent's move
-            if not done:
-                # Opponent's move
-                env.opponent_move(opponent_model)
-                # Check if the game is over after the opponent's move
-                if env.board.is_game_over():
-                    result = env.board.result()
-                    final_reward = env.get_game_result_reward(result)
-                    reward += final_reward  # Add final reward to agent's reward
-                    done = True
-            else:
-                # The game ended after the agent's move
-                pass
 
             # Store experiences
             states.append(state_input)
@@ -99,16 +95,25 @@ def train(episodes, save_path, existing_model_path=None):
 
             # Update the state
             state = env.board
-            if done:
-                break  # Exit the loop when the game is over
 
-        # Compute returns and perform policy gradient update
+            if not done:
+                # Opponent's move
+                if episode % 2 == 0:
+                    env.opponent_random_move()
+                else:
+                    env.opponent_move(opponent_model)  # You may implement a random opponent or use a weak engine
+
+                # Check if game is over after opponent's move
+                if env.board.is_game_over():
+                    result = env.board.result()
+                    final_reward = env.get_game_result_reward(result)
+                    rewards[-1] += final_reward  # Add final reward
+                    done = True
+                    info['result'] = env.get_result_string(result)
+
+        # Compute returns and perform policy-value update
         returns = compute_returns(rewards, gamma=0.99)
-        states_array = np.array(states)
-        masks_array = np.array(masks)
-        actions_array = np.array(actions)
-        returns_array = np.array(returns)
-        policy_gradient_update(model, optimizer, states_array, masks_array, actions_array, returns_array)
+        policy_value_update(model, optimizer, states, masks, actions, returns)
 
         # Calculate total reward and episode length
         total_reward = sum(rewards)
@@ -116,12 +121,12 @@ def train(episodes, save_path, existing_model_path=None):
         average_reward = total_reward / episode_length if episode_length > 0 else 0
 
         # Print episode info
-        print(f"Episode {episode + 1}/{episodes} completed. "
-              f"Total Reward: {total_reward:.2f}, "
-              f"Episode Length: {episode_length}, "
+        game_result = info.get('result', 'unknown')
+        print(f"Episode {episode + 1}/{episodes} completed. Result: {game_result}, "
+              f"Total Reward: {total_reward:.2f}, Episode Length: {episode_length}, "
               f"Average Reward per Step: {average_reward:.4f}")
 
-        # Save the entire model periodically (e.g., every 100 episodes)
+        # Save the model periodically
         if (episode + 1) % 100 == 0:
             model.save(save_path, include_optimizer=True)
             print(f"Model saved to {save_path} at episode {episode + 1}")
@@ -131,4 +136,8 @@ def train(episodes, save_path, existing_model_path=None):
     print(f"Model saved to {save_path}")
 
 # Start training
-train(episodes=10, save_path="/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/models/best_trained_transformer_model.keras", existing_model_path="/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/models/best_trained_transformer_model.keras")
+train(
+    episodes=10000,
+    save_path='best_trained_model_cnn_1.keras',
+    existing_model_path='best_trained_model_cnn_1.keras'  # Set to None if training from scratch
+)

@@ -1,194 +1,132 @@
 import chess
 import numpy as np
 import random
-
 from utils import (
     NUM_SQUARES,
     NUM_PROMOTION_OPTIONS,
     NUM_MOVES,
     PROMOTION_PIECES,
-    convert_board_to_sequence,
     encode_move,
     decode_action,
-    get_legal_moves_mask,
+    get_legal_moves_mask, board_to_planes,
 )
 
 class ChessEnvironment:
     def __init__(self, agent_color=chess.WHITE):
         self.agent_color = agent_color
         self.board = chess.Board()
-        self.previous_material_balance = self.get_material_balance()
-        self.previous_board_total_value = self.get_board_total_value()
+        self.previous_positions = set()
+        self.repetition_count = {}
 
     def reset(self):
+        """Reset the board to the initial position."""
         self.board.reset()
-        self.previous_material_balance = self.get_material_balance()
-        self.previous_board_total_value = self.get_board_total_value()
+        self.previous_positions = set()
+        self.repetition_count = {}
         return self.board
 
     def move(self, move):
-        reward = 0
+        """
+        Makes the agent's move if it is legal. Returns (next_state, reward, done, info).
+        Reward structure:
+          • +1 to +9 for capturing pieces (pawn=+1, knight/bishop=+3, rook=+5, queen=+9).
+          • -0.05 per move (step penalty).
+          • -1 × (repetitions of position - 1), to discourage repeated boards.
+          • If a checkmate/termination:
+               Win: +100
+               Draw: -10
+               Loss: -100
+          • Illegal move: -5 and terminate episode.
+        """
+        reward = 0.0
         done = False
         info = {}
 
-        # Check if move is legal
+        # If move is legal:
         if move in self.board.legal_moves:
-            # Agent's move
-            captured_piece_value = self.get_capture_value(move)
+            # Small bonus for capturing an opponent's piece
+            capture_reward = self.get_capture_value(move)
+            reward += capture_reward
+
+            # Execute the move
             self.board.push(move)
 
-            # Additional reward for capturing opponent's pieces
-            if captured_piece_value > 0:
-                reward += captured_piece_value
-                info['captured_piece'] = f"Captured opponent's piece worth {captured_piece_value}"
+            # Small step penalty to encourage faster resolution
+            reward -= 0.05
 
-            # Penalize for losing valuable pieces
-            lost_piece_value = self.get_lost_piece_value()
-            if lost_piece_value > 0:
-                reward -= lost_piece_value
-                info['lost_piece'] = f"Lost own piece worth {lost_piece_value}"
+            # Update repetition count / penalty
+            self.update_repetition_count()
+            repetition_penalty = self.get_repetition_penalty()
+            reward -= repetition_penalty
 
-            # Encourage development and castling
-            development_reward = self.get_development_reward()
-            reward += development_reward
-
-            # Check for game over after agent's move
+            # Check for game over (checkmate, draw, etc.)
             if self.board.is_game_over():
-                result = self.board.result()
+                result = self.board.result()  # e.g. '1-0', '0-1', '1/2-1/2'
                 reward += self.get_game_result_reward(result)
                 done = True
                 info['result'] = self.get_result_string(result)
-                return self.board, reward, done, info
-
-            # Small time penalty per move to encourage faster wins
-            reward -= 0.01  # Adjust as needed
 
             return self.board, reward, done, info
+
         else:
-            # Penalize illegal moves heavily and end the episode
-            reward -= 10
-            done = True
-            info['result'] = 'illegal move'
-            return self.board, reward, done, info
+            # Illegal move => immediate penalty and episode ends
+            return self.board, -5.0, True, {'result': 'illegal move'}
 
     def opponent_move(self, opponent_model):
+        """
+        Example method for letting an opponent (e.g., a trained model) move.
+        You can also replace this with a random or heuristic opponent.
+        """
         if not self.board.is_game_over():
-            # Convert board to sequence
-            state_input = convert_board_to_sequence(self.board)
-            # Generate legal moves mask
+            state_input = board_to_planes(self.board)
             mask = get_legal_moves_mask(self.board)
 
-            # Expand dimensions for batch size
-            state_input_expanded = np.expand_dims(state_input, axis=0)  # Shape: (1, 64)
-            mask_input_expanded = np.expand_dims(mask, axis=0)  # Shape: (1, num_moves)
+            # Expand dims for batch input
+            state_input_expanded = np.expand_dims(state_input, axis=0)
+            mask_input_expanded = np.expand_dims(mask, axis=0)
 
-            # Prepare model inputs
-            model_inputs = {'input_seq': state_input_expanded, 'mask_input': mask_input_expanded}
-            # Get action probabilities
-            action_probs = opponent_model.predict(model_inputs, verbose=0).ravel()
-            # Choose an action based on the probabilities
+            model_inputs = {
+                'input_board': state_input_expanded,
+                'mask_input': mask_input_expanded
+            }
+            policy_output, _ = opponent_model.predict(model_inputs, verbose=0)
+            action_probs = policy_output.ravel()
+
+            # Sample an action from predicted probabilities
             action_index = np.random.choice(NUM_MOVES, p=action_probs)
-            opponent_move = decode_action(action_index)
-            # Ensure the move is legal
-            if opponent_move in self.board.legal_moves:
-                self.board.push(opponent_move)
+            opp_move = decode_action(action_index)
+
+            # Fallback if move is illegal
+            if opp_move in self.board.legal_moves:
+                self.board.push(opp_move)
             else:
-                # In rare cases, the chosen move might be illegal
-                # Choose a random legal move as a fallback
                 legal_moves = list(self.board.legal_moves)
-                opponent_move = random.choice(legal_moves)
-                self.board.push(opponent_move)
+                if legal_moves:
+                    self.board.push(random.choice(legal_moves))
 
-    def get_material_balance(self):
-        # Compute material from the agent's perspective
-        material = 0
-        for piece in self.board.piece_map().values():
-            value = self.get_piece_value(piece)
-            if piece.color == self.agent_color:
-                material += value
-            else:
-                material -= value
-        return material
-
-    def get_board_total_value(self):
-        # Sum of all pieces' values on the board
-        total_value = sum(self.get_piece_value(piece) for piece in self.board.piece_map().values())
-        return total_value
-
-    def get_capture_value(self, move):
-        # Return the value of the captured opponent's piece
-        if self.board.is_capture(move):
-            captured_square = move.to_square
-            captured_piece = self.board.piece_at(captured_square)
-            if captured_piece and captured_piece.color != self.agent_color:
-                return self.get_piece_value(captured_piece)
-        return 0
-
-    def get_lost_piece_value(self):
-        # Calculate if the agent lost a piece due to the opponent's last move
-        current_board_value = self.get_board_total_value()
-        lost_value = self.previous_board_total_value - current_board_value
-        self.previous_board_total_value = current_board_value
-        if lost_value > 0:
-            return lost_value
-        return 0
-
-    def get_development_reward(self):
-        # Encourage development of pieces and castling
-        reward = 0
-        # Check if the agent has castled
-        if self.has_castled():
-            reward += 0.5  # Reward for castling
-        # Reward for developing minor pieces
-        developed_pieces = self.count_developed_pieces()
-        reward += developed_pieces * 0.1  # Adjust scaling as needed
-        return reward
-
-    def has_castled(self):
-        # Check if the agent has castled
-        if self.agent_color == chess.WHITE:
-            king_start_square = chess.E1
-        else:
-            king_start_square = chess.E8
-
-        # Get the king's current square
-        king_square = self.board.king(self.agent_color)
-
-        # If the king is not on the starting square
-        if king_square != king_start_square:
-            # Check if the king has moved two squares horizontally (castling move)
-            if abs(chess.square_file(king_square) - chess.square_file(king_start_square)) == 2:
-                return True
-        return False
-
-    def count_developed_pieces(self):
-        # Count the number of minor pieces (knights and bishops) that have been moved from their starting positions
-        starting_positions = {
-            chess.WHITE: [chess.B1, chess.G1, chess.C1, chess.F1],
-            chess.BLACK: [chess.B8, chess.G8, chess.C8, chess.F8],
-        }
-        developed_pieces = 0
-        for square in starting_positions[self.agent_color]:
-            piece = self.board.piece_at(square)
-            if not piece or piece.color != self.agent_color or piece.piece_type not in [chess.KNIGHT, chess.BISHOP]:
-                developed_pieces += 1
-        return developed_pieces
-
-    def get_piece_value(self, piece):
-        # Assign values to pieces
-        values = {'p': 1.0, 'n': 3.0, 'b': 3.0, 'r': 5.0, 'q': 9.0, 'k': 0.0}
-        return values[piece.symbol().lower()]
+    def opponent_random_move(self):
+        """Example fallback: random move for the opponent."""
+        if not self.board.is_game_over():
+            legal_moves = list(self.board.legal_moves)
+            self.board.push(random.choice(legal_moves))
 
     def get_game_result_reward(self, result):
+        """
+        Returns a large reward (positive for win, negative for loss, moderate negative for draw).
+        Increase or decrease these magnitudes as desired.
+        """
         if (result == '1-0' and self.agent_color == chess.WHITE) or \
            (result == '0-1' and self.agent_color == chess.BLACK):
-            return 10  # Agent wins
+            return 100.0   # Win
         elif result == '1/2-1/2':
-            return 0  # Draw
+            return -10.0   # Draw
         else:
-            return -10  # Agent loses
+            return -100.0  # Loss
 
     def get_result_string(self, result):
+        """
+        Helper for logging or debugging.
+        """
         if result == '1-0':
             return 'white wins'
         elif result == '0-1':
@@ -196,5 +134,46 @@ class ChessEnvironment:
         else:
             return 'draw'
 
+    def get_capture_value(self, move):
+        """
+        Small reward for capturing opponent pieces. Pawn=+1, Knight/Bishop=+3, Rook=+5, Queen=+9.
+        You can adjust if you'd like smaller/higher capturing incentives as well.
+        """
+        if self.board.is_capture(move):
+            captured_square = move.to_square
+            captured_piece = self.board.piece_at(captured_square)
+            if captured_piece and captured_piece.color != self.agent_color:
+                piece_type = captured_piece.piece_type
+                if piece_type == chess.PAWN:
+                    return 1.0
+                elif piece_type in [chess.KNIGHT, chess.BISHOP]:
+                    return 3.0
+                elif piece_type == chess.ROOK:
+                    return 5.0
+                elif piece_type == chess.QUEEN:
+                    return 9.0
+        return 0.0
+
+    def update_repetition_count(self):
+        """
+        Track how many times the current position (FEN) has appeared.
+        """
+        fen = self.board.board_fen()
+        self.repetition_count[fen] = self.repetition_count.get(fen, 0) + 1
+
+    def get_repetition_penalty(self):
+        """
+        Returns a small penalty if positions start repeating.
+        By default: -1 × (# of times that position has occurred - 1).
+        This discourages the agent from repeating the same position.
+        """
+        fen = self.board.board_fen()
+        count = self.repetition_count.get(fen, 0)
+        if count > 1:
+            # Example: -1 for the second time, -2 for the third time, etc.
+            return float(count - 1)
+        return 0.0
+
     def legal_moves(self):
+        """Optional helper to return list of legal moves."""
         return list(self.board.legal_moves)
