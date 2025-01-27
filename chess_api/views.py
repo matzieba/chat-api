@@ -1,20 +1,18 @@
 import numpy as np
-# import tensorflow as tf
+import tensorflow as tf
 from django.db import transaction
 from rest_framework import viewsets, status, serializers
 from rest_framework.response import Response
 import chess
-import requests
 
-import settings
 from chat_api.models import User
+from chess_api.mcts import MCTSNode, evaluate_position, expand_node, mcts_search
 from chess_api.models import ChessGame
-# from chess_engine.engine.utils import initialize_move_encoding, board_to_planes, encode_move, get_legal_moves_mask, NUM_MOVES
-
+from chess_api.parallell_mcts import run_mcts_leaf_parallel
 
 # Load your trained model
-MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/best_trained_model_cnn.keras"
-# model = tf.keras.models.load_model(MODEL_PATH)
+MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/train_supervised/my_chess_model.keras"
+model = tf.keras.models.load_model(MODEL_PATH)
 
 # Initialize move encoding
 # initialize_move_encoding()
@@ -71,7 +69,7 @@ class GameViewSet(viewsets.ModelViewSet):
             if board.is_game_over():
                 game.game_status = self.get_game_status(board)
             else:
-                move = self.get_ai_move_from_service(board)  # move is a chess.Move object
+                move = self.get_model_move(board)  # move is a chess.Move object
                 board.push(move)
                 game.current_player = 'white'
 
@@ -107,66 +105,78 @@ class GameViewSet(viewsets.ModelViewSet):
         return "ongoing"
 
     # def get_model_move(self, board):
-    #     # Use board_to_planes to get the input_board of shape (8, 8, 14)
-    #     state = board_to_planes(board)  # Returns shape (8, 8, 14)
+    #     # Create a root node for MCTS
+    #     root = MCTSNode(board=board)
     #
-    #     # Generate the mask_input
-    #     mask = get_legal_moves_mask(board)
+    #     # Evaluate position for root node; expand it right away
+    #     policy, value = evaluate_position(board, model)
+    #     expand_node(root, policy)
     #
-    #     # Expand dimensions to add batch size (1)
-    #     state_input = np.expand_dims(state, axis=0)  # Shape: (1, 8, 8, 14)
-    #     mask_input = np.expand_dims(mask, axis=0)    # Shape: (1, NUM_MOVES)
+    #     # Run MCTS search
+    #     # Adjust simulations=, c_puct= as needed
+    #     result_node = mcts_search(root, model, simulations=600, c_puct=1.0)
     #
-    #     # Prepare inputs as a dictionary
-    #     inputs = {'input_board': state_input, 'mask_input': mask_input}
+    #     # The best move is the one that leads to 'result_node' from the root
+    #     best_move = None
+    #     for move, child in root.children.items():
+    #         if child is result_node:
+    #             best_move = move
+    #             break
     #
-    #     # Get the output probabilities
-    #     model_outputs = model.predict(inputs, verbose=0)
-    #     policy_output = model_outputs[0]  # Get the first output (policy)
-    #     output_probs = policy_output.ravel()
-    #
-    #     # Now, select the move with the highest probability among legal moves
-    #     legal_moves = list(board.legal_moves)
-    #     valid_moves = []
-    #     valid_indices = []
-    #     for move in legal_moves:
-    #         try:
-    #             action_index = encode_move(move)
-    #             valid_moves.append(move)
-    #             valid_indices.append(action_index)
-    #         except (ValueError, IndexError):
-    #             continue
-    #
-    #     # Get probabilities for valid moves
-    #     valid_probs = output_probs[valid_indices]
-    #     best_index = np.argmax(valid_probs)
-    #     best_move = valid_moves[best_index]
     #     return best_move
 
-    def get_ai_move_from_service(self, board):
-        """ Make a POST request to the tf_service to obtain the AI move and convert it to a chess.Move object. """
-        tf_service_url = settings.TF_SERVICE_URL  # e.g., 'http://tf_service:8000'
-        endpoint = f"{tf_service_url}/predict-move"
-        payload = {"fen": board.fen()}
-        try:
-            response = requests.post(endpoint, json=payload, timeout=5)
-        except requests.exceptions.RequestException as e:
-            # Handle request exceptions
-            print(f"Failed to connect to AI service: {e}")
-            return None
+    def get_model_move(self, board):
+        """
+        Use a leaf-parallel MCTS approach to get the AI move.
+        """
+        # Create the MCTS root node
+        root = MCTSNode(board=board)
 
-        if response.status_code == 200:
-            best_move_uci = response.json().get("best_move")
-            if best_move_uci:
-                try:
-                    move = chess.Move.from_uci(best_move_uci)
-                    return move  # Return the chess.Move object
-                except ValueError:
-                    print(f"Invalid move format received from AI service: {best_move_uci}")
-                    return None
-            else:
-                print("AI service did not return a move.")
-                return None
-        else:
-            print(f"AI service returned an error: {response.status_code} - {response.text}")
-            return None
+        # Optionally, you can do an immediate expansion with the prior if you like:
+        # from chess_api.mcts import evaluate_position, expand_node
+        # policy, value = evaluate_position(board, model)
+        # expand_node(root, policy)
+
+        # Now run leaf-parallel MCTS
+        best_root = run_mcts_leaf_parallel(
+            root_node=root,
+            model=model,
+            num_simulations=600,
+            batch_size=64,
+            c_puct=3.5
+        )
+
+        # After MCTS, pick your best move. Typically, choose the child with highest visit_count.
+        best_move, best_child = max(
+            best_root.children.items(),
+            key=lambda item: item[1].visit_count
+        )
+        return best_move
+
+    # def get_ai_move_from_service(self, board):
+    #     """ Make a POST request to the tf_service to obtain the AI move and convert it to a chess.Move object. """
+    #     tf_service_url = settings.TF_SERVICE_URL  # e.g., 'http://tf_service:8000'
+    #     endpoint = f"{tf_service_url}/predict-move"
+    #     payload = {"fen": board.fen()}
+    #     try:
+    #         response = requests.post(endpoint, json=payload, timeout=5)
+    #     except requests.exceptions.RequestException as e:
+    #         # Handle request exceptions
+    #         print(f"Failed to connect to AI service: {e}")
+    #         return None
+    #
+    #     if response.status_code == 200:
+    #         best_move_uci = response.json().get("best_move")
+    #         if best_move_uci:
+    #             try:
+    #                 move = chess.Move.from_uci(best_move_uci)
+    #                 return move  # Return the chess.Move object
+    #             except ValueError:
+    #                 print(f"Invalid move format received from AI service: {best_move_uci}")
+    #                 return None
+    #         else:
+    #             print("AI service did not return a move.")
+    #             return None
+    #     else:
+    #         print(f"AI service returned an error: {response.status_code} - {response.text}")
+    #         return None

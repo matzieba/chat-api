@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  # PostgreSQL container
+  db:
+    image: postgres:14
+    container_name: db
+    environment:
+      POSTGRES_USER: chat_api
+      POSTGRES_PASSWORD: chat_api
+      POSTGRES_DB: chat_api
+    ports:
+      - "5432:5432"
+    networks:
+      - app_network
+
+  # FastAPI (TensorFlow) container
+  tf_service:
+    build:
+      dockerfile: ./tf_service/Dockerfile
+    container_name: tf_service
+    ports:
+      - "8001:8000"   # expose on localhost:8001
+    networks:
+      - app_network
+    depends_on:
+      - db
+#    volumes:
+      # If you want to mount local model files or keep them inside the container
+      # - ./tf_service/models:/app/models
+      # For now, we rely on model baked into the container
+#      - ./:/app
+
+  # Django container
+  django_service:
+    build:
+      context: .
+    container_name: django_service
+    ports:
+      - "8000:8000"   # expose on localhost:8000
+    networks:
+      - app_network
+    depends_on:
+      - db
+      - tf_service
+    environment:
+      # Django DB environment variables
+      DB_NAME: mydb
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: db
+      DB_PORT: 5432
+      # The TF service URL we use in Django settings
+      TF_SERVICE_URL: http://tf_service:8000
+
+networks:
+  app_network:
+    driver: bridge

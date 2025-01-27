@@ -184,7 +184,10 @@ DATABASES = {
         'NAME': os.environ.get('CHAT_API_DB_NAME', 'chat_api'),
         'USER': os.environ.get('CHAT_API_DB_USER', 'chat_api'),
         'PASSWORD': os.environ.get('CHAT_API_DB_PASSWORD', 'chat_api'),
-        "HOST": 'db',
+        "HOST": os.environ.get(
+            "EAT_SOUS_DB_GCP_HOST",
+            os.environ.get("EAT_SOUS_DB_HOST", "0.0.0.0"),
+        ),
         'PORT': os.environ.get('CHAT_API_DB_PORT', '5432'),
         'CONN_MAX_AGE': 0,
     }

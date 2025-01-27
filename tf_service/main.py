@@ -6,7 +6,7 @@ import chess
 from typing import List, Dict
 
 # Define the path to your trained Keras model
-MODEL_PATH = "best_trained_model_small_cnn_l2.keras"
+MODEL_PATH = "best_trained_model_small_cnn_l2_st.keras"
 
 # Load the model once when the service starts
 try:
