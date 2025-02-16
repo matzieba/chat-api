@@ -1,17 +1,20 @@
+import random
+
 import numpy as np
 import tensorflow as tf
 from django.db import transaction
 from rest_framework import viewsets, status, serializers
 from rest_framework.response import Response
 import chess
+import chess.engine
 
 from chat_api.models import User
-from chess_api.mcts import MCTSNode, evaluate_position, expand_node, mcts_search
+from chess_api.mcts import get_mcts_move
 from chess_api.models import ChessGame
-from chess_api.parallell_mcts import run_mcts_leaf_parallel
+
 
 # Load your trained model
-MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/train_supervised/my_chess_model.keras"
+MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/train_supervised/checkpoints_full_policy/epoch_02_valLoss_2.6843.keras"
 model = tf.keras.models.load_model(MODEL_PATH)
 
 # Initialize move encoding
@@ -69,7 +72,9 @@ class GameViewSet(viewsets.ModelViewSet):
             if board.is_game_over():
                 game.game_status = self.get_game_status(board)
             else:
-                move = self.get_model_move(board)  # move is a chess.Move object
+                # move = self.get_stockfish_move(board)
+                move = get_mcts_move(board, model)
+                # move = random.choice(list(board.legal_moves))
                 board.push(move)
                 game.current_player = 'white'
 
@@ -125,35 +130,22 @@ class GameViewSet(viewsets.ModelViewSet):
     #
     #     return best_move
 
-    def get_model_move(self, board):
-        """
-        Use a leaf-parallel MCTS approach to get the AI move.
-        """
-        # Create the MCTS root node
-        root = MCTSNode(board=board)
-
-        # Optionally, you can do an immediate expansion with the prior if you like:
-        # from chess_api.mcts import evaluate_position, expand_node
-        # policy, value = evaluate_position(board, model)
-        # expand_node(root, policy)
-
-        # Now run leaf-parallel MCTS
-        best_root = run_mcts_leaf_parallel(
-            root_node=root,
-            model=model,
-            num_simulations=600,
-            batch_size=64,
-            c_puct=3.5
-        )
-
-        # After MCTS, pick your best move. Typically, choose the child with highest visit_count.
-        best_move, best_child = max(
-            best_root.children.items(),
-            key=lambda item: item[1].visit_count
-        )
+    def get_model_move(self, board, model):
+        # For example, run 100 simulations (adjust as needed).
+        best_move = get_mcts_move(board, model, simulations=1000, batch_size=512)
         return best_move
 
-    # def get_ai_move_from_service(self, board):
+    def get_stockfish_move(self, board):
+        stockfish_path="/Users/mateuszzieba/Desktop/dev/chess/stockfish/src/stockfish"
+        stockfish_params = {"Skill Level": 1}
+        engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+        for param, value in stockfish_params.items():
+            engine.configure({param: value})
+        stockfish_move = engine.play(board, chess.engine.Limit(depth=1)).move
+        return stockfish_move
+
+
+        # def get_ai_move_from_service(self, board):
     #     """ Make a POST request to the tf_service to obtain the AI move and convert it to a chess.Move object. """
     #     tf_service_url = settings.TF_SERVICE_URL  # e.g., 'http://tf_service:8000'
     #     endpoint = f"{tf_service_url}/predict-move"

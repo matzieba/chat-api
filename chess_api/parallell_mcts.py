@@ -6,7 +6,7 @@ from chess_api.heuristics import evaluate_with_heuristics
 from chess_api.mcts import MCTSNode
 from chess_engine.engine.small_model.transformer.environment import (
     encode_board,
-    build_move_mask,
+
     move_to_index
 )
 
@@ -20,16 +20,14 @@ def evaluate_batch_in_worker(boards, model):
 
     # Encode all boards in a batch
     encoded_batch = []
-    mask_batch = []
-    for board in boards:
-        encoded_batch.append(encode_board(board))
-        mask_batch.append(build_move_mask(board))
-    encoded_batch = np.array(encoded_batch, dtype=np.float32)
-    mask_batch = np.array(mask_batch, dtype=np.float32)
 
+    for board in boards:
+        enc = encode_board(board)
+        encoded_batch.append(enc)
+    encoded_batch = np.array(encoded_batch, dtype=np.float32)
     # Single forward pass for the entire batch
     policy_logits_batch, net_value_batch = model.predict(
-        {"input_board": encoded_batch, "mask_input": mask_batch},
+        {"board_input": encoded_batch},
         verbose=0
     )
 

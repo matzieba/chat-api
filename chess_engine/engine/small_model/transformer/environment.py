@@ -2,28 +2,37 @@ import chess
 import numpy as np
 
 # We reduce the move space to 64 * 64 = 4096 (ignore piece promotions).
-NUM_MOVES = 64 * 64
+NUM_MOVES = 64 * 64 * 2
 
 ###############################################################################
 # Move Encoding/Decoding
 ###############################################################################
-def move_to_index(move: chess.Move) -> int:
-    """
-    Convert a chess.Move into an integer index in [0..4095].
-    We ignore promotions for this reduced move space.
-    """
+def move_to_index(move):
     from_sq = move.from_square
     to_sq = move.to_square
-    return from_sq * 64 + to_sq
+    base = from_sq * 64 + to_sq  # [0..4095]
+    if move.promotion == chess.QUEEN:
+        return 4096 + base
+    else:
+        return base
+
 
 def index_to_move(move_idx: int, board: chess.Board) -> chess.Move:
     """
-    Inverse of move_to_index. Ignores promotions.
-    If it's not legal for the current board, calling code must handle that.
+    Converts an integer in [0..8191] back into a chess.Move object.
+    Skips underpromotions (only handles promotions to queen).
     """
-    to_sq = move_idx % 64
-    from_sq = move_idx // 64
-    return chess.Move(from_sq, to_sq)
+    if move_idx < 4096:
+        # Normal move
+        from_sq = move_idx // 64
+        to_sq   = move_idx % 64
+        return chess.Move(from_sq, to_sq)
+    else:
+        # Queen promotion
+        offset  = move_idx - 4096
+        from_sq = offset // 64
+        to_sq   = offset % 64
+        return chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
 
 ###############################################################################
 # Board Encoding
@@ -78,14 +87,13 @@ def encode_board(board: chess.Board) -> np.ndarray:
 ###############################################################################
 def build_move_mask(board: chess.Board) -> np.ndarray:
     """
-    Return a 0/1 mask of shape (4096,) indicating which moves (from_sq->to_sq)
-    are legal for the current board under our reduced indexing scheme.
+    Return a 0/1 mask of shape (20,480) indicating which moves
+    (from_sq->to_sq plus optional promotion) are legal.
     """
     mask = np.zeros(NUM_MOVES, dtype=np.float32)
     for move in board.legal_moves:
         idx = move_to_index(move)
-        if 0 <= idx < NUM_MOVES:
-            mask[idx] = 1.0
+        mask[idx] = 1.0
     return mask
 
 ###############################################################################

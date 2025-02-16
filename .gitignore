@@ -70,3 +70,6 @@ firebase-cert.json
 .DS_Store
 .env
 .env.local
+chess_engine/engine/train_supervised/data_prepared
+chess_engine/engine/train_supervised/data_tfrecords
+chess_engine/engine/train_supervised/data_tfrecords_sharded

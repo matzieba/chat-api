@@ -1,171 +1,291 @@
+import math
 import numpy as np
 import chess
+from collections import deque
 
-from chess_api.heuristics import evaluate_with_heuristics
-from chess_engine.engine.small_model.transformer.environment import encode_board, build_move_mask, move_to_index
+# Adjust if needed
+from chess_engine.engine.small_model.transformer.environment import (
+    encode_board, move_to_index
+)
+
+NUM_MOVES = 8192  # Typically 4096 for 64 squares x 64 squares
 
 
 class MCTSNode:
-    def __init__(self, board, parent=None, prior=0.0):
+    """
+    A single node in the MCTS tree.
+      - board: current chess.Board
+      - parent: parent node
+      - prior: policy probability for this node
+      - children: dict of {move: MCTSNode}
+      - visit_count: how many times this node has been visited
+      - value_sum: sum of backpropagated values
+    """
+    def __init__(self, board, parent=None, prior=1.0):
         self.board = board
         self.parent = parent
+        self.prior = prior
         self.children = {}
-        self.prior = prior   # P(s,a) from policy
         self.visit_count = 0
         self.value_sum = 0.0
 
     @property
-    def q_value(self):
-        if self.visit_count == 0:
-            return 0
-        return self.value_sum / self.visit_count
+    def Q(self):
+        return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
 
-    def u_value(self, c_puct=1.0):
-        return c_puct * self.prior * (
-            (self.parent.visit_count**0.5) / (1 + self.visit_count)
-        )
+    @property
+    def P(self):
+        return self.prior
 
-def mcts_search(root, model, simulations=100, c_puct=1.0):
-    for _ in range(simulations):
-        node = root
+    def expand(self, policy_logits):
+        """
+        Create children for all legal moves, with prior = policy_logits[move_index].
+        Skips promotions if that matches your training approach.
+        """
+        if self.board.is_game_over():
+            return
 
-        # 1. Selection: navigate down the tree
-        while node.children:
-            node = select_child(node, c_puct)
+        for move in self.board.legal_moves:
+            idx = move_to_index(move)
+            if not (0 <= idx < NUM_MOVES):
+                continue
 
-        # 2. Expansion: expand the leaf
-        if not node.board.is_game_over():
-            policy, value = evaluate_position(node.board, model)
-            expand_node(node, policy)
+            prob = policy_logits[idx]
+            next_board = self.board.copy()
+            next_board.push(move)
+            self.children[move] = MCTSNode(board=next_board, parent=self, prior=prob)
 
-        else:
-            # If game is over, evaluate final outcome
-            if node.board.is_checkmate():
-                # If the side to move is in checkmate, it’s losing for that side
-                value = -1.0
-            else:
-                # Stalemate or draw
-                value = 0.0
+    def is_leaf(self):
+        return len(self.children) == 0
 
-        # 3. Backpropagation
-        backpropagate(node, value)
+    def is_root(self):
+        return self.parent is None
 
-    # After simulations, pick the move with highest visit_count
-    best_child = max(root.children.values(), key=lambda c: c.visit_count)
-    return best_child
 
 def select_child(node, c_puct):
-    """Select the child whose (Q + U) is maximum."""
+    """
+    Select child with maximum UCB = Q + c_puct * P * sqrt(node.visit_count)/(1+child.visit_count).
+    """
     best_score = -float('inf')
-    best_child = None
+    best_move, best_child = None, None
+
     for move, child in node.children.items():
-        score = child.q_value + child.u_value(c_puct)
-        if score > best_score:
-            best_score = score
+        ucb = (child.Q +
+               c_puct * child.P * math.sqrt(node.visit_count + 1) / (child.visit_count + 1))
+        if ucb > best_score:
+            best_score = ucb
+            best_move = move
             best_child = child
-    return best_child
+    return best_move, best_child
 
-def evaluate_position(board, model):
-    """
-    Return (policy, value) from your neural net model for the given board,
-    then combine with heuristics.
-    """
-    # 1) Encode board
-    state = encode_board(board)
-    mask = build_move_mask(board)
-
-    # 2) NN prediction
-    state_input = np.expand_dims(state, axis=0)
-    mask_input = np.expand_dims(mask, axis=0)
-
-    policy_logits, nn_value = model.predict(
-        {"input_board": state_input, "mask_input": mask_input},
-        verbose=0
-    )
-    policy_logits = policy_logits[0]  # shape: (NUM_MOVES,)
-    nn_value = float(nn_value[0])     # shape: ()
-
-    # 3) Build a dictionary {move: prior} only for legal moves
-    legal_moves = list(board.legal_moves)
-    move_policy = {}
-    for move in legal_moves:
-        try:
-            action_index = move_to_index(move)
-            move_policy[move] = policy_logits[action_index]
-        except (ValueError, IndexError):
-            move_policy[move] = 0.0
-
-    # Normalize policy to get probabilities
-    total_policy = sum(move_policy[m] for m in move_policy)
-    if total_policy > 0:
-        for m in move_policy:
-            move_policy[m] /= total_policy
-    else:
-        # fallback -> uniform
-        uniform_prob = 1.0 / max(1, len(legal_moves))
-        for m in move_policy:
-            move_policy[m] = uniform_prob
-
-    # 4) Combine the network's value with heuristic
-    #    You may choose different blending factors or clamping.
-    heuristic_value = evaluate_with_heuristics(board)
-
-    # Optionally clamp the heuristic to the [-1,+1] range if it can get large:
-    # or you can map it in some other way
-    h_clamped = max(-1.0, min(1.0, heuristic_value))
-
-    # Weighted sum:
-    alpha = 0.7 # 70% neural net, 30% heuristics
-    combined_value = alpha * nn_value + (1 - alpha) * h_clamped
-
-    return move_policy, combined_value
-
-def expand_node(node, move_policy):
-    """
-    Create a child node for each legal move, setting the prior from the policy distribution.
-    """
-    for move, prior in move_policy.items():
-        board_copy = node.board.copy()
-        board_copy.push(move)
-        child_node = MCTSNode(board=board_copy, parent=node, prior=prior)
-        node.children[move] = child_node
 
 def backpropagate(node, value):
+    """
+    Traverse back up the tree, flipping 'value' each step, because each parent
+    is the opposing side's perspective.
+    """
     current = node
-    # “value” is from the perspective of the side to move on 'node'
+    current_value = value
     while current is not None:
         current.visit_count += 1
-        current.value_sum += value
-        # Flip perspective (assuming the model always outputs from side-to-move’s perspective)
-        value = -value
+        current.value_sum += current_value
+        current_value = -current_value
         current = current.parent
 
 
-def build_policy_vector(root_node):
+def simulate_one(node, pending_expansions, c_puct):
     """
-    Builds a policy vector of shape (NUM_MOVES,) from the MCTS root node
-    by normalizing each child's visit count.
-
-    :param root_node: The MCTSNode representing the root of the current search tree.
-    :return: A NumPy array of shape (NUM_MOVES,) representing the policy distribution
-             (probability of each move) based on visit counts.
+    Perform one simulation step:
+      1) Selection: descend tree until leaf or terminal node
+      2) If terminal, backprop result
+      3) Else add leaf to 'pending_expansions'
+    Returns: the leaf node (or None if terminal).
     """
-    import numpy as np
-    from chess_engine.engine.small_model.transformer.environment import move_to_index, NUM_MOVES
+    current = node
+    while not current.is_leaf() and not current.board.is_game_over():
+        _, current = select_child(current, c_puct)
 
-    # Sum the visit counts over all children
-    total_visits = sum(child.visit_count for child in root_node.children.values())
+    if current.board.is_game_over():
+        # Terminal position => assign value
+        if current.board.is_checkmate():
+            # The side to move was just mated => from their perspective, value = -1
+            value = -1.0
+        else:
+            # Stalemate or draw => value = 0
+            value = 0.0
+        backpropagate(current, value)
+        return None
+    else:
+        pending_expansions.append(current)
+        return current
 
-    # Initialize a zero policy vector
-    policy_vector = np.zeros(NUM_MOVES, dtype=np.float32)
 
-    # If there are no children (terminal position), return the zero vector
-    if total_visits == 0:
-        return policy_vector
+def expand_and_backprop(batch_nodes, policy_logits_list, values_list):
+    """
+    For each leaf node in 'batch_nodes', expand its children with policy_logits
+    and backprop the returned 'value'.
+    """
+    for node, policy_logits, value in zip(batch_nodes, policy_logits_list, values_list):
+        node.expand(policy_logits)
+        backpropagate(node, value)
 
-    # Set policy_vector[move_index] based on normalized visit counts
-    for move, child in root_node.children.items():
-        move_idx = move_to_index(move)
-        policy_vector[move_idx] = child.visit_count / total_visits
 
-    return policy_vector
+def run_mcts(root, model, simulations=1600, c_puct=1.0, batch_size=16):
+    """
+    Run MCTS from 'root' for 'simulations' iterations, doing batched expansions
+    of up to 'batch_size' leaves per neural net call.
+    """
+    if root.board.is_game_over():
+        return
+
+    # Expand root once
+    input_data = np.expand_dims(encode_board(root.board), axis=0)
+    policy, val = model.predict(input_data, verbose=0)
+    root.expand(policy[0])
+    backpropagate(root, val[0][0])
+
+    sim_count = 0
+    while sim_count < simulations:
+        pending_expansions = []
+
+        # Up to batch_size selection steps
+        for _ in range(batch_size):
+            if sim_count >= simulations:
+                break
+            leaf = simulate_one(root, pending_expansions, c_puct)
+            sim_count += 1
+
+        if not pending_expansions:
+            continue
+
+        # Prepare a single batch inference
+        boards_encoded = [
+            encode_board(leaf_node.board) for leaf_node in pending_expansions
+        ]
+        inp = np.array(boards_encoded, dtype=np.float32)
+        policy_logits_batch, value_batch = model.predict(inp, verbose=0)
+
+        # Expand children and backprop for each leaf
+        expand_and_backprop(pending_expansions, policy_logits_batch, value_batch)
+
+
+def mcts_search(board, model, simulations=1600, c_puct=1.0, batch_size=16):
+    """
+    Create a root node for 'board', run MCTS, pick the best move by visit_count.
+    Returns the best move.
+    """
+    root = MCTSNode(board=board, parent=None, prior=1.0)
+    if not board.is_game_over():
+        run_mcts(root, model, simulations=simulations, c_puct=c_puct, batch_size=batch_size)
+
+    best_move, best_child = None, None
+    best_visits = -1
+    for move, child in root.children.items():
+        if child.visit_count > best_visits:
+            best_visits = child.visit_count
+            best_move = move
+            best_child = child
+
+    return best_move
+
+
+def get_mcts_move(board, model, simulations=1024, batch_size=256):
+    """
+    High-level convenience function to run MCTS on 'board' for 'simulations'
+    and return the best move. Fallback to any legal move if no child found.
+    """
+    if board.is_game_over():
+        return None
+
+    move = mcts_search(
+        board=board,
+        model=model,
+        simulations=simulations,
+        c_puct=1.0,
+        batch_size=batch_size
+    )
+
+    if move is None:
+        # fallback
+        legal_moves = list(board.legal_moves)
+        return legal_moves[0] if legal_moves else None
+    return move
+
+
+###############################################################################
+# ADDITIONAL HELPER METHODS REQUESTED
+###############################################################################
+
+def get_mcts_root(board, model, simulations=500, batch_size=16, c_puct=1.0):
+    """
+    Create and return the fully searched MCTS root node for 'board'.
+    Useful if you want to examine or manipulate the root after MCTS.
+    """
+    root = MCTSNode(board=board, parent=None, prior=1.0)
+    if not board.is_game_over():
+        run_mcts(root, model, simulations=simulations, c_puct=c_puct, batch_size=batch_size)
+    return root
+
+
+def extract_policy_vector(root, num_moves):
+    policy_vec = np.zeros(num_moves, dtype=np.float32)
+    total_visits = 0.0
+    for move, child in root.children.items():
+        idx = move_to_index(move)
+        if 0 <= idx < num_moves:
+            # Make sure child's visit_count is finite
+            if not np.isfinite(child.visit_count):
+                # You can log or raise an error if it's NaN
+                continue
+            policy_vec[idx] = child.visit_count
+            total_visits += child.visit_count
+
+    # Normalizing if total_visits > 0
+    if total_visits > 0.0:
+        policy_vec /= total_visits
+    else:
+        # Fallback: either leave it all zeros (which is invalid)
+        # or distribute uniform among the known children:
+        legal_moves = list(root.children.keys())
+        for move in legal_moves:
+            idx = move_to_index(move)
+            if 0 <= idx < num_moves:
+                policy_vec[idx] = 1.0 / len(legal_moves)
+
+    return policy_vec
+
+
+def select_move_from_root(root, temperature=1.0):
+    """
+    Select a move from the root node's children according to visit counts,
+    applying 'temperature'. If temperature=0, picks argmax. Otherwise,
+    picks stochastically in proportion to (visit_count ^ (1/temperature)).
+
+    Returns a (move, chosen_child) pair, or (None, None) if board is game-over.
+    """
+    if root.board.is_game_over() or not root.children:
+        return None, None
+
+    # Build array of children with their visits
+    moves = list(root.children.keys())
+    visits = np.array([root.children[m].visit_count for m in moves], dtype=np.float32)
+
+    if temperature <= 1e-6:
+        # Argmax (no randomness)
+        best_idx = np.argmax(visits)
+        best_move = moves[best_idx]
+        return best_move, root.children[best_move]
+    else:
+        # Weighted random
+        # (visit_count ^ (1 / temperature))
+        exponentiated = np.power(visits, 1.0 / temperature)
+        total = np.sum(exponentiated)
+        if total < 1e-12:
+            # fallback if all zero
+            best_idx = np.random.choice(len(moves))
+            best_move = moves[best_idx]
+            return best_move, root.children[best_move]
+        probs = exponentiated / total
+        choice_idx = np.random.choice(len(moves), p=probs)
+        chosen_move = moves[choice_idx]
+        return chosen_move, root.children[chosen_move]
