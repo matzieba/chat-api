@@ -9,7 +9,6 @@ from chess_engine.engine.small_model.transformer.environment import (
 )
 
 def create_example(board_array, move_idx):
-    """Convert board_array (shape [64,14]) to TF Example with features 'board' and 'move'."""
     board_bytes = board_array.tobytes()
     feature = {
         "board": tf.train.Feature(bytes_list=tf.train.BytesList(value=[board_bytes])),
@@ -24,10 +23,7 @@ def parse_and_write_tfrecords(
     skip_promotion=True,
     max_total_bytes=100 * 1024**3  # 100 GB
 ):
-    """
-    Reads PGN files, writes positions into TFRecord shards, each up to 'shard_size' positions.
-    Stops altogether once total size exceeds 'max_total_bytes'.
-    """
+
     os.makedirs(output_dir, exist_ok=True)
 
     shard_index = 0
@@ -99,12 +95,6 @@ def parse_and_write_tfrecords(
                         writer = tf.io.TFRecordWriter(
                             os.path.join(output_dir, f"train_shard_{shard_index}.tfrecord")
                         )
-
-                # End of this game
-            # End of pgn_file
-        # if pgn_file
-
-    # Close last writer
     writer.close()
     print(f"Done. Wrote {positions_written} positions total across {shard_index + 1} shards.")
     print(f"Approx total bytes written: {total_bytes}")
@@ -117,6 +107,6 @@ if __name__ == "__main__":
         pgn_files,
         shard_size=50000,
         output_dir="data_tfrecords_1",
-        skip_promotion=True,
-        max_total_bytes=100 * 1024**3  # 100 GB
+        skip_promotion=False,
+        max_total_bytes=100 * 1024**3
     )

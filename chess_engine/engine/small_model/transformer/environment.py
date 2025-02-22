@@ -1,42 +1,58 @@
 import chess
 import numpy as np
-
-# We reduce the move space to 64 * 64 = 4096 (ignore piece promotions).
-NUM_MOVES = 64 * 64
-
+NUM_MOVES = 20480
 ###############################################################################
 # Move Encoding/Decoding
 ###############################################################################
 def move_to_index(move: chess.Move) -> int:
     """
-    Convert a chess.Move into an integer index in [0..4095].
-    We ignore promotions for this reduced move space.
+    Convert chess.Move into an index that also encodes promotions.
+    We use the scheme:
+       index = from_square*64*5 + to_square*5 + promo_code
+    where promo_code = 0 for no promotion, 1=N, 2=B, 3=R, 4=Q.
     """
-    from_sq = move.from_square
-    to_sq = move.to_square
-    return from_sq * 64 + to_sq
+    promo_code = 0
+    if move.promotion:  # If it's a promotion move
+        if move.promotion == chess.KNIGHT:
+            promo_code = 1
+        elif move.promotion == chess.BISHOP:
+            promo_code = 2
+        elif move.promotion == chess.ROOK:
+            promo_code = 3
+        elif move.promotion == chess.QUEEN:
+            promo_code = 4
+
+    return move.from_square * 64 * 5 + move.to_square * 5 + promo_code
 
 def index_to_move(move_idx: int, board: chess.Board) -> chess.Move:
     """
-    Inverse of move_to_index. Ignores promotions.
-    If it's not legal for the current board, calling code must handle that.
+    Convert our expanded index (with promotions) back to a chess.Move.
+    We first parse (from_sq, to_sq, promo_code).
+    Then we construct the move with or without promotion.
     """
-    to_sq = move_idx % 64
-    from_sq = move_idx // 64
-    return chess.Move(from_sq, to_sq)
+    from_sq = (move_idx // (64*5))
+    remainder = move_idx % (64*5)
+    to_sq = remainder // 5
+    promo_code = remainder % 5
+
+    promotion_piece = None
+    if promo_code == 1:
+        promotion_piece = chess.KNIGHT
+    elif promo_code == 2:
+        promotion_piece = chess.BISHOP
+    elif promo_code == 3:
+        promotion_piece = chess.ROOK
+    elif promo_code == 4:
+        promotion_piece = chess.QUEEN
+
+    # Construct the move
+    return chess.Move(from_sq, to_sq, promotion=promotion_piece)
 
 ###############################################################################
 # Board Encoding
 ###############################################################################
 def encode_board(board: chess.Board) -> np.ndarray:
-    """
-    Encode the board into a shape (64, 14) numpy array.
-    Each of the 64 squares gets 14 channels:
-      Channels 0..5  = White Pawn, Knight, Bishop, Rook, Queen, King
-      Channels 6..11 = Black Pawn, Knight, Bishop, Rook, Queen, King
-      Channel 12     = side to move (1 if white, else 0)
-      Channel 13     = castling rights bit-encoding
-    """
+
     encoded = np.zeros((64, 14), dtype=np.float32)
 
     piece_type_to_channel = {
@@ -77,10 +93,6 @@ def encode_board(board: chess.Board) -> np.ndarray:
 # Move Mask
 ###############################################################################
 def build_move_mask(board: chess.Board) -> np.ndarray:
-    """
-    Return a 0/1 mask of shape (4096,) indicating which moves (from_sq->to_sq)
-    are legal for the current board under our reduced indexing scheme.
-    """
     mask = np.zeros(NUM_MOVES, dtype=np.float32)
     for move in board.legal_moves:
         idx = move_to_index(move)
@@ -92,9 +104,7 @@ def build_move_mask(board: chess.Board) -> np.ndarray:
 # Root Dirichlet Noise Injection
 ###############################################################################
 def inject_dirichlet_noise(root_node, alpha=0.03, eps=0.25):
-    """
-    Blend each child's 'prior' values with Dirichlet noise to encourage exploration.
-    """
+
     import numpy as np
 
     moves = list(root_node.children.keys())
@@ -125,11 +135,7 @@ def inject_dirichlet_noise(root_node, alpha=0.03, eps=0.25):
 # Temperature Application
 ###############################################################################
 def apply_temperature(policy, temperature=1.0):
-    """
-    Apply temperature to a probability distribution:
-      pᵢ^(1/tau) / Σⱼ [pⱼ^(1/tau)].
-    If temperature is near 0, this approximates argmax selection.
-    """
+
     if temperature < 1e-9:
         out = np.zeros_like(policy)
         out[np.argmax(policy)] = 1.0
@@ -140,3 +146,4 @@ def apply_temperature(policy, temperature=1.0):
         # fallback to uniform
         return np.ones_like(policy) / len(policy)
     return adjusted / adjusted_sum
+
