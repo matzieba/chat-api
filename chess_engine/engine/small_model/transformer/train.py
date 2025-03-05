@@ -2,676 +2,508 @@ import os
 import random
 import pickle
 from collections import deque
+import concurrent.futures
+import time
 
 import chess
 import chess.engine
 import numpy as np
-from tensorboard.compat import tf
-from tensorflow.keras import layers, Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.regularizers import l2
+import tensorflow as tf
 
-# ---------------
-# Local imports from your code
-# ---------------
-from openings import opening_fens
-from chess_api.heuristics import evaluate_with_heuristics
-from environment import (
-    encode_board,
-    build_move_mask,
-    inject_dirichlet_noise,
-    apply_temperature,
-    index_to_move,
-    NUM_MOVES,
+from chess_api.mcts import run_mcts_batched, encode_node_4frames, MCTSNode
+from chess_engine.engine.train_supervised.parse_pgn_alpha0 import (
+    encode_single_board,
     move_to_index
 )
-from chess_api.mcts import MCTSNode, build_policy_vector
-from chess_api.parallell_mcts import run_mcts_leaf_parallel
 
-MAX_BUFFER_SIZE = 400000
+###############################################################################
+# 0) Constants & Utilities
+###############################################################################
+NUM_MOVES = 64 * 64 * 5  # from_sq * 64 * 5 + to_sq * 5 + promo_code
+MAX_BUFFER_SIZE = 90000
 REPLAY_BUFFER_FILE = "replay_buffer.pkl"
-REPLAY_BUFFER_FILE_STOCKFISH = "replay_buffer_stock_fish_mixed.pkl"
 
 ###############################################################################
-# Medium Model Definition (unchanged)
+# 1) Popular Openings (in SAN)
+#    We'll pick a random one for the model to *force* in the early moves
 ###############################################################################
-def create_medium_chess_model(
-    board_shape=(64, 14),
-    num_moves=NUM_MOVES,
-    num_filters=64,
-    num_res_blocks=3,
-    learning_rate=2e-3,
-    l2_reg=1e-5
+POPULAR_OPENINGS = [
+    "e4 e5 Nf3 Nc6 Bb5",
+    "e4 e5 Nf3 d6 d4 exd4 Nxd4",
+    "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6",
+    "d4 d5 c4 e6 Nc3 Nf6",
+    "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6",
+    "e4 e6 d4 d5 Nc3 Bb4",
+    "e4 c6 d4 d5 Nc3 dxe4 Nxe4",
+    "d4 d5 c4 c6 Nf3 Nf6 Nc3 e6",
+    "e4 c5 Nf3 e6 d4 cxd4 Nxd4 a6",
+    "e4 e5 Nf3 Nc6 Bc4 Bc5 c3 Nf6",
+    "e4 e5 Nf3 Nc6 d4 exd4 Nxd4 Nf6",
+    "e4 g6 d4 Bg7 Nc3 d6 f4 Nf6",
+    "c4 e6 Nc3 d5 d4 Nf6",
+    "e4 c5 Nf3 Nc6 d4 cxd4 Nxd4 Nf6 Nc3 d6",
+    "d4 d5 Bf4 Nf6 e3 e6 Nf3 c5 c3"
+]
+
+
+def select_forced_opening(prob=0.6):
+    """
+    With some probability, choose a random opening line (SAN strings).
+    Returns a list of SAN moves or None if we skip forcing any opening.
+    """
+    if random.random() < prob:
+        opening_line = random.choice(POPULAR_OPENINGS)
+        return opening_line.split()  # list of SAN moves
+    return None
+
+
+###############################################################################
+# Global model pointer used by each worker
+###############################################################################
+MODEL = None  # Will be set in init_worker
+
+
+def init_worker(model_path):
+    """
+    Called once in each worker process to load the model into a global variable.
+    Avoids reloading the model for each game; ensures distinct RNG seeds.
+    """
+    worker_seed = os.getpid() ^ int(time.time())
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    tf.random.set_seed(worker_seed)
+
+    global MODEL
+    if MODEL is None:
+        print(f"Worker {os.getpid()} is loading model from: {model_path}")
+        loaded_model = tf.keras.models.load_model(model_path, compile=False)
+        # IMPORTANT: Use sparse CE, since we store single integer labels:
+        loaded_model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss=["sparse_categorical_crossentropy", "mean_squared_error"]
+        )
+        MODEL = loaded_model
+    else:
+        print(f"Worker {os.getpid()} already has a loaded model.")
+
+
+###############################################################################
+# 1) Self-play & Stockfish Game Logic with forced opening moves
+###############################################################################
+def self_play_game_batched(
+    model,
+    n_mcts_sims=400,
+    mcts_batch_size=200,
+    opening_prob=0.5,
+    add_dirichlet_noise=True,
+    dirichlet_alpha=0.3,
+    dirichlet_epsilon=0.25
 ):
-    input_board = layers.Input(shape=board_shape, name="input_board")
-    mask_input = layers.Input(shape=(num_moves,), name="mask_input")
+    """
+    Self-play with optional forced opening moves for both sides.
+    We now store only the argmax move index as the policy label.
+    """
+    board = chess.Board()
+    forced_line = select_forced_opening(prob=opening_prob)
+    forced_index = 0
 
-    # Reshape to (8,8,14)
-    x = layers.Reshape((8, 8, board_shape[-1]))(input_board)
-    x = layers.Conv2D(
-        filters=num_filters,
-        kernel_size=3,
-        padding="same",
-        activation="relu",
-        kernel_regularizer=l2(l2_reg)
-    )(x)
+    positions = []
+    while not board.is_game_over() and len(board.move_stack) < 600:
+        # If we still have forced moves left:
+        if forced_line and forced_index < len(forced_line):
+            next_san = forced_line[forced_index]
+            try:
+                forced_move = board.parse_san(next_san)
+            except ValueError:
+                forced_move = None
 
-    for _ in range(num_res_blocks):
-        residual = x
-        x = layers.Conv2D(num_filters, 3, padding="same", use_bias=False, kernel_regularizer=l2(l2_reg))(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation("relu")(x)
-        x = layers.Conv2D(num_filters, 3, padding="same", use_bias=False, kernel_regularizer=l2(l2_reg))(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.add([x, residual])
-        x = layers.Activation("relu")(x)
+            if forced_move and forced_move in board.legal_moves:
+                enc = encode_node_4frames(MCTSNode(board=board), max_frames=4)
+                # Single-integer label:
+                forced_move_idx = move_to_index(forced_move)
 
-    # Policy head
-    policy_conv = layers.Conv2D(
-        filters=2,
-        kernel_size=1,
-        activation="relu",
-        kernel_regularizer=l2(l2_reg)
-    )(x)
-    policy_flat = layers.Flatten()(policy_conv)
-    logits = layers.Dense(num_moves, kernel_regularizer=l2(l2_reg), name="logits")(policy_flat)
+                side_is_white = board.turn
+                positions.append((enc, forced_move_idx, side_is_white))
 
-    # Mask out illegal moves with a large negative
-    negative_inf = -1e9
-    masked_logits = logits + (1.0 - mask_input) * negative_inf
-    policy_output = layers.Softmax(name="policy_output")(masked_logits)
+                board.push(forced_move)
+                forced_index += 1
+                continue
+            else:
+                forced_line = None
 
-    # Value head
-    value_conv = layers.Conv2D(
-        filters=1,
-        kernel_size=1,
-        activation="relu",
-        kernel_regularizer=l2(l2_reg)
-    )(x)
-    value_flat = layers.Flatten()(value_conv)
-    value_dense = layers.Dense(128, activation="relu", kernel_regularizer=l2(l2_reg))(value_flat)
-    value_output = layers.Dense(1, activation="tanh", name="value_output")(value_dense)
+        # If no forced move => run MCTS normally
+        node = MCTSNode(board=board)
+        enc = encode_node_4frames(node, max_frames=4)
+        best_move, _policy_dist = run_mcts_batched(
+            model=model,
+            root_board=board,
+            n_simulations=n_mcts_sims,
+            batch_size=mcts_batch_size,
+            temperature=0.4,
+            add_dirichlet_noise=add_dirichlet_noise,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon
+        )
+        if best_move is None:
+            break
 
-    model = Model(inputs=[input_board, mask_input], outputs=[policy_output, value_output])
-    model.compile(
-        optimizer=Adam(learning_rate=learning_rate),
-        loss={
-            "policy_output": "categorical_crossentropy",
-            "value_output": "mean_squared_error"
-        },
-        loss_weights={
-            "policy_output": 1.0,
-            "value_output": 1.0
-        },
-        metrics={
-            "policy_output": [
-                tf.keras.metrics.CategoricalAccuracy(name="policy_accuracy"),
-                tf.keras.metrics.TopKCategoricalAccuracy(k=5, name="policy_top5_accuracy")
-            ]
-        }
-    )
-    return model
+        best_move_idx = move_to_index(best_move)
+        side_to_move_is_white = board.turn
+        positions.append((enc, best_move_idx, side_to_move_is_white))
+
+        board.push(best_move)
+
+    # Final outcome from White's perspective
+    result_str = board.result()
+    if result_str == "1-0":
+        outcome_for_white = 1.0
+    elif result_str == "0-1":
+        outcome_for_white = -1.0
+    else:
+        outcome_for_white = 0.0
+
+    print(f"self-play game result: {result_str}")
+
+    # Build training data
+    training_data = []
+    for (enc, move_idx, side_is_white) in positions:
+        val = outcome_for_white if side_is_white else -outcome_for_white
+        training_data.append((enc, move_idx, val))
+
+    return training_data
+
+
+def play_game_vs_stockfish_batched(
+    model,
+    stockfish_path,
+    stockfish_params=None,
+    n_mcts_sims=400,
+    mcts_batch_size=200,
+    opening_prob=0.5,
+    add_dirichlet_noise=True,
+    dirichlet_alpha=0.3,
+    dirichlet_epsilon=0.25
+):
+    """
+    Model vs. Stockfish, forced opening moves only for the MODEL side.
+    Single-integer labeling: each position is tagged with the best_move_idx.
+    """
+    if stockfish_params is None:
+        stockfish_params = {"Skill Level": 15}
+
+    engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+    engine.configure(stockfish_params)
+
+    board = chess.Board()
+    model_is_white = bool(random.getrandbits(1))
+
+    forced_line = select_forced_opening(prob=opening_prob)
+    forced_index = 0
+
+    model_positions = []
+    sf_positions = []
+
+    while not board.is_game_over() and len(board.move_stack) < 600:
+        if (board.turn == chess.WHITE and model_is_white) or \
+           (board.turn == chess.BLACK and not model_is_white):
+
+            # Possibly forced move
+            forced_move = None
+            if forced_line and forced_index < len(forced_line):
+                san = forced_line[forced_index]
+                try:
+                    parsed = board.parse_san(san)
+                    if parsed in board.legal_moves:
+                        forced_move = parsed
+                    else:
+                        forced_line = None
+                except ValueError:
+                    forced_line = None
+
+            if forced_move:
+                enc = encode_node_4frames(MCTSNode(board=board), max_frames=4)
+                forced_move_idx = move_to_index(forced_move)
+
+                side_white = board.turn
+                model_positions.append((enc, forced_move_idx, side_white))
+
+                board.push(forced_move)
+                forced_index += 1
+
+            else:
+                # MCTS
+                node = MCTSNode(board=board)
+                enc = encode_node_4frames(node, max_frames=4)
+                best_move, _policy_dist = run_mcts_batched(
+                    model=model,
+                    root_board=board,
+                    n_simulations=n_mcts_sims,
+                    batch_size=mcts_batch_size,
+                    temperature=0.2,
+                    add_dirichlet_noise=add_dirichlet_noise,
+                    dirichlet_alpha=dirichlet_alpha,
+                    dirichlet_epsilon=dirichlet_epsilon
+                )
+                if best_move is None:
+                    break
+
+                best_move_idx = move_to_index(best_move)
+                side_white = board.turn
+                model_positions.append((enc, best_move_idx, side_white))
+                board.push(best_move)
+
+        else:
+            # Stockfish's turn
+            sf_node = MCTSNode(board=board)
+            sf_enc = encode_node_4frames(sf_node, max_frames=4)
+
+            sf_move = engine.play(board, chess.engine.Limit(depth=1)).move
+            if sf_move is None or not board.is_legal(sf_move):
+                print("Stockfish returned an illegal move or None.")
+                break
+
+            sf_move_idx = move_to_index(sf_move)
+            side_white = board.turn
+            sf_positions.append((sf_enc, sf_move_idx, side_white))
+
+            board.push(sf_move)
+
+    engine.quit()
+
+    # Final outcome
+    result_str = board.result()
+    if result_str == "1-0":
+        white_score = 1.0
+    elif result_str == "0-1":
+        white_score = -1.0
+    else:
+        white_score = 0.0
+
+    if model_is_white:
+        outcome_for_model = white_score
+    else:
+        outcome_for_model = -white_score
+
+    if outcome_for_model > 0:
+        print("Model WON against Stockfish.")
+    elif outcome_for_model < 0:
+        print("Model LOST against Stockfish.")
+    else:
+        print("Model DREW against Stockfish.")
+
+    # Combine positions
+    training_data = []
+    # Model moves (label from the model's perspective):
+    for (enc, move_idx, side_is_white) in model_positions:
+        val = outcome_for_model if (side_is_white == model_is_white) else -outcome_for_model
+        training_data.append((enc, move_idx, val))
+
+    # Stockfish moves (label from White's perspective):
+    for (enc, move_idx, side_is_white) in sf_positions:
+        val_sf = white_score if side_is_white == chess.WHITE else -white_score
+        training_data.append((enc, move_idx, val_sf))
+
+    return training_data
+
 
 ###############################################################################
-# Training on (board, mask, policy_target, value_target)
+# 2) Single-game worker function
+###############################################################################
+def run_one_game_in_worker(
+    game_index,
+    stockfish_games_ratio,
+    stockfish_path,
+    stockfish_params,
+    n_mcts_sims,
+    mcts_batch_size
+):
+    global MODEL
+    if MODEL is None:
+        raise RuntimeError("Global MODEL was not initialized in the worker!")
+
+    r = random.random()
+    if stockfish_path and r < stockfish_games_ratio:
+        # Game vs Stockfish
+        training_data = play_game_vs_stockfish_batched(
+            model=MODEL,
+            stockfish_path=stockfish_path,
+            stockfish_params=stockfish_params,
+            n_mcts_sims=n_mcts_sims,
+            mcts_batch_size=mcts_batch_size,
+            opening_prob=0,
+            add_dirichlet_noise=False,
+            dirichlet_alpha=0.1,
+            dirichlet_epsilon=0.1
+        )
+        game_type = "Stockfish"
+    else:
+        # Self-Play
+        training_data = self_play_game_batched(
+            model=MODEL,
+            n_mcts_sims=n_mcts_sims,
+            mcts_batch_size=mcts_batch_size,
+            opening_prob=0.7,
+            add_dirichlet_noise=True,
+            dirichlet_alpha=0.3,
+            dirichlet_epsilon=0.3
+        )
+        game_type = "Self-Play"
+
+    print(f"Game {game_index} completed: {game_type}, got {len(training_data)} samples.")
+    return training_data
+
+
+###############################################################################
+# 3) Training the Model
 ###############################################################################
 def train_model(model, training_data, batch_size=64, epochs=3):
-    encoded_boards, masks, policy_targets, value_targets = zip(*training_data)
+    """
+    Training data is: (board_enc, single_move_idx, value).
+    We'll store single_move_idx in y_pol, so we use sparse_categorical_crossentropy.
+    """
+    boards = []
+    policy_moves = []
+    value_labels = []
 
-    encoded_boards = np.array(encoded_boards, dtype=np.float32)
-    masks = np.array(masks, dtype=np.float32)
-    policy_targets = np.array(policy_targets, dtype=np.float32)
-    value_targets = np.array(value_targets, dtype=np.float32).reshape(-1, 1)
+    for (enc, move_idx, val) in training_data:
+        boards.append(enc)
+        policy_moves.append(move_idx)
+        value_labels.append(val)
 
-    history = model.fit(
-        x=[encoded_boards, masks],
-        y={
-            "policy_output": policy_targets,
-            "value_output": value_targets
-        },
+    x = np.array(boards, dtype=np.float32)           # shape (N, 64, 14*frames) or similar
+    y_pol = np.array(policy_moves, dtype=np.int32)   # shape (N,); single integer label
+    y_val = np.array(value_labels, dtype=np.float32).reshape(-1, 1)  # shape (N,1)
+
+    hist = model.fit(
+        x=x,
+        y=[y_pol, y_val],
         batch_size=batch_size,
         epochs=epochs,
         verbose=1
     )
-    return history
+    return hist
+
 
 ###############################################################################
-# Self-Play Game
+# 4) Main Loop - Parallel Version
 ###############################################################################
-def self_play_game(
-    model,
-    temperature,
-    alpha,
-    eps,
-    num_simulations,
-    opening_fens=opening_fens,
-    opening_probability=0.9
-):
-    """
-    Generate one game via self-play. Returns a list of (encoded_board, mask, policy_vec, final_value)
-    where final_value is from the perspective of the side that was to move in that position.
-    """
-    # Randomly pick an opening or start from scratch
-    use_opening = (opening_fens is not None) and (random.random() < opening_probability)
-    if use_opening:
-        fen = random.choice(opening_fens)
-        board = chess.Board(fen)
-    else:
-        board = chess.Board()
-
-    game_history = []
-
-    while not board.is_game_over() and len(board.move_stack) < 600:
-        side_to_move = board.turn  # ADDED: record who is about to move
-        if num_simulations == 1:
-            # Quick heuristic-based move
-            enc = encode_board(board)
-            mask = build_move_mask(board)
-            legal_moves = list(board.legal_moves)
-
-            best_move = None
-            best_value = -9999.0
-            sign = 1 if board.turn == chess.WHITE else -1
-
-            for mv in legal_moves:
-                board.push(mv)
-                val = sign * evaluate_with_heuristics(board)
-                board.pop()
-                if val > best_value:
-                    best_value = val
-                    best_move = mv
-
-            policy_target = np.zeros(NUM_MOVES, dtype=np.float32)
-            if best_move:
-                idx = move_to_index(best_move)
-                policy_target[idx] = 1.0
-                board.push(best_move)
-            else:
-                best_move = random.choice(legal_moves)
-                board.push(best_move)
-                idx = move_to_index(best_move)
-                policy_target[idx] = 1.0
-
-            # Store position
-            game_history.append((enc, mask, policy_target, side_to_move))  # ADDED side_to_move
-        else:
-            # MCTS
-            root_node = MCTSNode(board)
-            best_root = run_mcts_leaf_parallel(
-                root_node=root_node,
-                model=model,
-                num_simulations=num_simulations,
-                batch_size=32,
-                c_puct=2.5
-            )
-
-            enc = encode_board(board)
-            mask = build_move_mask(board)
-            if len(board.move_stack) < 10:
-                inject_dirichlet_noise(best_root, alpha=alpha, eps=eps)
-            policy_target = build_policy_vector(best_root)
-
-            # Temperature
-            if len(board.move_stack) < 5:
-                current_temperature = temperature
-            else:
-                current_temperature = 0.0
-            policy_target = apply_temperature(policy_target, temperature=current_temperature)
-
-            # Sample a move
-            move_idx = np.random.choice(np.arange(NUM_MOVES), p=policy_target)
-            move = index_to_move(move_idx, board)
-            if move not in board.legal_moves:
-                move = random.choice(list(board.legal_moves))
-
-            board.push(move)
-            game_history.append((enc, mask, policy_target, side_to_move))  # ADDED side_to_move
-
-    # Game outcome from White's perspective
-    result_str = board.result()
-    if result_str == "1-0":
-        white_outcome = 1.0
-    elif result_str == "0-1":
-        white_outcome = -1.0
-    else:
-        white_outcome = 0.0
-
-    print(f"Self-play game finished with result: {result_str}")
-
-    # ADDED: Build training_data with perspective flipping
-    training_data = []
-    for (enc, m, pi, side) in game_history:
-        # If side == chess.WHITE, value is white_outcome
-        # If side == chess.BLACK, value is -white_outcome
-        # This ensures each position is labeled from the side-to-move perspective
-        value_label = white_outcome if side == chess.WHITE else -white_outcome
-        training_data.append((enc, m, pi, value_label))
-
-    return training_data
-
-###############################################################################
-# Model vs. Stockfish Game
-###############################################################################
-def play_game_vs_stockfish(
-    model,
-    stockfish_path,
-    stockfish_params,
-    temperature=1.2,
-    alpha=0.1,
-    eps=0.2,
-    num_simulations=10,
-    opening_fens=opening_fens,
-    opening_probability=0.1
-):
-    """
-    One game between the model (using MCTS) and Stockfish.
-    We randomly pick who plays White. We only collect positions from the model's moves,
-    labeling them from the model's perspective (i.e. +1 if the model eventually won,
-    -1 if it lost) rather than side-to-move perspective.
-    """
-    # Open engine
-    engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-    # Configure Stockfish parameters
-    for param, value in stockfish_params.items():
-        engine.configure({param: value})
-
-    # Optionally pick an opening or start from scratch
-    use_opening = (opening_fens is not None) and (random.random() < opening_probability)
-    if use_opening:
-        fen = random.choice(opening_fens)
-        board = chess.Board(fen)
-    else:
-        board = chess.Board()
-
-    # Randomly decide who will play White
-    model_white = bool(random.getrandbits(1))
-    print(f"Model plays {'White' if model_white else 'Black'} against Stockfish.")
-
-    game_history = []
-
-    while not board.is_game_over() and len(board.move_stack) < 600:
-        if (board.turn == chess.WHITE and model_white) or (board.turn == chess.BLACK and not model_white):
-            # Model's turn
-            if board.is_game_over():
-                break
-
-            if num_simulations == 1:
-                # Quick heuristic-based move
-                enc = encode_board(board)
-                mask = build_move_mask(board)
-                legal_moves = list(board.legal_moves)
-
-                best_move = None
-                best_value = -9999.0
-                sign = 1 if board.turn == chess.WHITE else -1
-
-                for mv in legal_moves:
-                    board.push(mv)
-                    val = sign * evaluate_with_heuristics(board)
-                    board.pop()
-                    if val > best_value:
-                        best_value = val
-                        best_move = mv
-
-                policy_target = np.zeros(NUM_MOVES, dtype=np.float32)
-                if best_move:
-                    idx = move_to_index(best_move)
-                    policy_target[idx] = 1.0
-                    board.push(best_move)
-                else:
-                    best_move = random.choice(legal_moves)
-                    board.push(best_move)
-                    idx = move_to_index(best_move)
-                    policy_target[idx] = 1.0
-
-                game_history.append((enc, mask, policy_target))
-            else:
-                # MCTS
-                root_node = MCTSNode(board)
-                best_root = run_mcts_leaf_parallel(
-                    root_node=root_node,
-                    model=model,
-                    num_simulations=num_simulations,
-                    batch_size=32,
-                    c_puct=3.5
-                )
-
-                enc = encode_board(board)
-                mask = build_move_mask(board)
-                if len(board.move_stack) < 10:
-                    inject_dirichlet_noise(best_root, alpha=alpha, eps=eps)
-                policy_target = build_policy_vector(best_root)
-
-                # Temperature
-                if len(board.move_stack) < 20:
-                    current_temperature = temperature
-                else:
-                    current_temperature = 0.0
-                policy_target = apply_temperature(policy_target, temperature=current_temperature)
-
-                # Sample a move
-                move_idx = np.random.choice(np.arange(NUM_MOVES), p=policy_target)
-                move = index_to_move(move_idx, board)
-                if move not in board.legal_moves:
-                    move = random.choice(list(board.legal_moves))
-
-                board.push(move)
-                game_history.append((enc, mask, policy_target))
-        else:
-            # Stockfish's turn
-            if board.is_game_over():
-                break
-            stockfish_move = engine.play(board, chess.engine.Limit(depth=8)).move
-            board.push(stockfish_move)
-
-    engine.quit()
-
-    # Game outcome from the model's perspective
-    result_str = board.result()
-    if result_str == "1-0":
-        outcome = 1.0 if model_white else -1.0
-    elif result_str == "0-1":
-        outcome = -1.0 if model_white else 1.0
-    else:
-        outcome = 0.0
-
-    print(f"Stockfish game finished with result: {result_str}")
-
-    # Attach final result to model's positions
-    training_data = [(enc, m, pi, outcome) for (enc, m, pi) in game_history]
-    return training_data
-
-###############################################################################
-# Model vs. Second Saved Model
-###############################################################################
-def play_game_vs_second_model(
-    main_model,
-    second_model,
-    temperature=1.2,
-    alpha=0.1,
-    eps=0.2,
-    num_simulations=10,
-    opening_fens=opening_fens,
-    opening_probability=0.2
-):
-    """
-    One game between main_model and second_model, both using MCTS.
-    We collect positions/training data only from main_model's moves,
-    labeling them from main_model's perspective.
-    """
-    # Optionally pick an opening or start from scratch
-    use_opening = (opening_fens is not None) and (random.random() < opening_probability)
-    if use_opening:
-        fen = random.choice(opening_fens)
-        board = chess.Board(fen)
-    else:
-        board = chess.Board()
-
-    # Randomly decide who plays White
-    main_model_white = bool(random.getrandbits(1))
-    print(
-        "Main model plays {} vs second model.".format(
-            "White" if main_model_white else "Black"
-        )
-    )
-
-    game_history = []
-
-    while not board.is_game_over() and len(board.move_stack) < 600:
-        if (board.turn == chess.WHITE and main_model_white) or (board.turn == chess.BLACK and not main_model_white):
-            # Main model's turn
-            if board.is_game_over():
-                break
-
-            root_node = MCTSNode(board)
-            best_root = run_mcts_leaf_parallel(
-                root_node=root_node,
-                model=main_model,
-                num_simulations=num_simulations,
-                batch_size=32,
-                c_puct=3.5
-            )
-
-            enc = encode_board(board)
-            mask = build_move_mask(board)
-            if len(board.move_stack) < 10:
-                inject_dirichlet_noise(best_root, alpha=alpha, eps=eps)
-            policy_target = build_policy_vector(best_root)
-
-            if len(board.move_stack) < 20:
-                current_temperature = temperature
-            else:
-                current_temperature = 0.0
-            policy_target = apply_temperature(policy_target, temperature=current_temperature)
-
-            move_idx = np.random.choice(np.arange(NUM_MOVES), p=policy_target)
-            move = index_to_move(move_idx, board)
-            if move not in board.legal_moves:
-                move = random.choice(list(board.legal_moves))
-
-            board.push(move)
-            game_history.append((enc, mask, policy_target))
-        else:
-            # Second model's turn
-            if board.is_game_over():
-                break
-
-            root_node = MCTSNode(board)
-            best_root = run_mcts_leaf_parallel(
-                root_node=root_node,
-                model=second_model,
-                num_simulations=1,
-                batch_size=32,
-                c_puct=3.5
-            )
-
-            # For the second model, we don't collect training data for our buffer
-            policy_target = build_policy_vector(best_root)
-            if len(board.move_stack) < 20:
-                current_temperature = temperature
-            else:
-                current_temperature = 0.0
-            policy_target = apply_temperature(policy_target, temperature=current_temperature)
-
-            move_idx = np.random.choice(np.arange(NUM_MOVES), p=policy_target)
-            move = index_to_move(move_idx, board)
-            if move not in board.legal_moves:
-                move = random.choice(list(board.legal_moves))
-
-            board.push(move)
-
-    # Game outcome from main_model's perspective
-    result_str = board.result()
-    if result_str == "1-0":
-        outcome = 1.0 if main_model_white else -1.0
-    elif result_str == "0-1":
-        outcome = -1.0 if main_model_white else 1.0
-    else:
-        outcome = 0.0
-
-    print(f"Model vs. second model game finished with result: {result_str}")
-
-    # Attach final result to main model's positions
-    training_data = [(enc, m, pi, outcome) for (enc, m, pi) in game_history]
-    return training_data
-
-###############################################################################
-# Main Self-Play + Extra Opponents Training Loop
-###############################################################################
-def main_self_play_loop(
+def main_self_play_loop_parallel(
     num_iterations,
     games_per_iteration,
-    num_simulations,
     model_path,
-    learning_rate,
-    stockfish_ratio=0.2,
+    replay_buffer_file=REPLAY_BUFFER_FILE,
+    stockfish_games_ratio=0.1,
     stockfish_path=None,
     stockfish_params=None,
-    second_model_path=None,
-    second_model_ratio=0.2,
+    n_mcts_sims=400,
+    mcts_batch_size=200,
+    num_workers=6
 ):
     """
-    In each iteration:
-      - A portion of games is self-play,
-      - A portion vs. Stockfish (stockfish_ratio),
-      - A portion vs. second saved model (second_model_ratio).
-    The total of (stockfish_ratio + second_model_ratio) can be less than 1.0,
-    meaning the remainder of games is self-play.
+    High-level repeated procedure (parallelized):
+      1) Load model once in main process (for logging, summary).
+      2) Load or create replay buffer.
+      3) For each iteration:
+          a) Use ProcessPoolExecutor to run games in parallel (init_worker).
+          b) Gather all training data, add to replay buffer.
+          c) Sample from replay buffer & train the main model.
+          d) Save model & replay buffer.
     """
+    # 1) Load model for logging in main process
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"No model found at: {model_path}")
 
-    # Default Stockfish params if not provided
-    if stockfish_params is None:
-        stockfish_params = {"Skill Level": 5}
+    print(f"Loading initial model from: {model_path}")
+    init_model = tf.keras.models.load_model(model_path, compile=False)
+    # Use sparse CE here as well:
+    init_model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        loss=["sparse_categorical_crossentropy", "mean_squared_error"]
+    )
+    init_model.summary()
 
-    # Step A: Load or create main model
-    if model_path and os.path.isfile(model_path):
-        print(f"Loading model from {model_path}")
-        main_model = tf.keras.models.load_model(model_path, compile=False)
-        main_model.compile(
-            optimizer=Adam(learning_rate=learning_rate),
-            loss={
-                "policy_output": "categorical_crossentropy",
-                "value_output": "mean_squared_error"
-            },
-            loss_weights={
-                "policy_output": 1.0,
-                "value_output": 1.0
-            },
-            metrics={
-                "policy_output": [
-                    tf.keras.metrics.CategoricalAccuracy(name="policy_accuracy"),
-                    tf.keras.metrics.TopKCategoricalAccuracy(k=5, name="policy_top5_accuracy")
-                ]
-            }
-        )
-    else:
-        print("Creating a new main model (no existing checkpoint found).")
-        main_model = create_medium_chess_model(
-            board_shape=(64, 14),
-            num_moves=NUM_MOVES,
-            num_filters=128,
-            num_res_blocks=8,
-            learning_rate=learning_rate,
-            l2_reg=1e-5
-        )
-        main_model.save(model_path)
-        main_model.summary()
-
-    # Optionally load second model (if provided)
-    second_model = None
-    if second_model_path and os.path.isfile(second_model_path):
-        print(f"Loading second model from {second_model_path}")
-        second_model = tf.keras.models.load_model(second_model_path, compile=False)
-        # We don't necessarily need to compile second model if only using inference,
-        # but you could do so:
-        second_model.compile(
-            optimizer=Adam(learning_rate=learning_rate),
-            loss={"policy_output": "categorical_crossentropy", "value_output": "mean_squared_error"}
-        )
-
-    # Step B: Load or create replay buffer
-    if os.path.isfile(REPLAY_BUFFER_FILE_STOCKFISH):
-        print(f"Loading replay buffer from {REPLAY_BUFFER_FILE_STOCKFISH}")
-        with open(REPLAY_BUFFER_FILE_STOCKFISH, "rb") as f:
+    # 2) Load or create replay buffer
+    if os.path.isfile(replay_buffer_file):
+        with open(replay_buffer_file, "rb") as f:
             replay_buffer = pickle.load(f)
+        print(f"Loaded replay buffer from {replay_buffer_file}, size={len(replay_buffer)}")
     else:
-        print("No existing replay buffer found. Creating a new one.")
         replay_buffer = deque(maxlen=MAX_BUFFER_SIZE)
+        print(f"No existing replay buffer found. Created new one (max={MAX_BUFFER_SIZE}).")
 
-    print(f"Replay buffer size is currently {len(replay_buffer)}.")
-
-    # Step C: Self-play + extra opponents for multiple iterations
+    # 3) Main loop
     for iteration in range(num_iterations):
-        print(f"\n=== Iteration {iteration + 1}/{num_iterations} ===")
+        print(f"\n=== Iteration {iteration + 1}/{num_iterations} ===\n")
         iteration_data = []
 
-        for g_idx in range(games_per_iteration):
-            # Randomly select the opponent type based on ratio
-            r = random.random()
-            if (stockfish_path is not None) and (r < stockfish_ratio):
-                # Play vs. Stockfish
-                data = play_game_vs_stockfish(
-                    model=main_model,
-                    stockfish_path=stockfish_path,
-                    stockfish_params=stockfish_params,
-                    temperature=1,
-                    alpha=0.1,
-                    eps=0.2,
-                    num_simulations=num_simulations,
-                    opening_fens=opening_fens,
-                    opening_probability=0.0
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=init_worker,
+            initargs=(model_path,)
+        ) as executor:
+            futures = [
+                executor.submit(
+                    run_one_game_in_worker,
+                    g_idx,
+                    stockfish_games_ratio,
+                    stockfish_path,
+                    stockfish_params,
+                    n_mcts_sims,
+                    mcts_batch_size
                 )
-                game_type = "Stockfish"
-            elif (second_model is not None) and (r < stockfish_ratio + second_model_ratio):
-                # Play vs second saved model
-                data = play_game_vs_second_model(
-                    main_model=main_model,
-                    second_model=second_model,
-                    temperature=1,
-                    alpha=0.1,
-                    eps=0.2,
-                    num_simulations=num_simulations,
-                    opening_fens=opening_fens,
-                    opening_probability=0.0
-                )
-                game_type = "Second model"
-            else:
-                # Normal self-play (AlphaZero style for both sides)
-                data = self_play_game(
-                    model=main_model,
-                    temperature=1,
-                    alpha=0.1,
-                    eps=0.2,
-                    num_simulations=num_simulations,
-                    opening_fens=opening_fens,
-                    opening_probability=0.6
-                )
-                game_type = "Self-play"
+                for g_idx in range(games_per_iteration)
+            ]
+            for f in concurrent.futures.as_completed(futures):
+                data = f.result()  # list of (enc, move_idx, val)
+                iteration_data.extend(data)
 
-            iteration_data.extend(data)
-            print(f"Completed {game_type} game {g_idx + 1}/{games_per_iteration}")
-
-        # Add new data to buffer
+        # Add new data to replay buffer
         for item in iteration_data:
             replay_buffer.append(item)
+        print(f"Replay buffer size is now {len(replay_buffer)}")
 
-        print(f"Replay buffer size after iteration: {len(replay_buffer)}")
-
-        # Step D: Sample from the buffer
-        if len(replay_buffer) < 100000:
+        # Sample from replay buffer
+        if len(replay_buffer) < 50000:
             sample_data = list(replay_buffer)
-            print(f"Using all {len(sample_data)} samples (buffer still small).")
+            print(f"Using all {len(sample_data)} samples (buffer < 50k).")
         else:
-            sample_data = random.sample(replay_buffer, 100000)
-            print(f"Sampling 100000 positions from replay buffer of size {len(replay_buffer)}.")
+            sample_data = random.sample(replay_buffer, 50000)
+            print(f"Sampled 50,000 positions from buffer of size {len(replay_buffer)}.")
 
-        # Step E: Train the main model
+        # Reload model & train
+        print("Reloading model in main process for training.")
+        model = tf.keras.models.load_model(model_path, compile=False)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss=["sparse_categorical_crossentropy", "mean_squared_error"]
+        )
         print(f"Training on {len(sample_data)} samples...")
-        train_model(main_model, sample_data, batch_size=32, epochs=4)
+        train_model(model, sample_data, batch_size=256, epochs=3)
 
-        # Step F: Save updated model
-        main_model.save(model_path)
-        print(f"Main model saved to {model_path}")
+        # Save model & replay buffer
+        model.save(model_path)
+        print(f"Model saved to {model_path}")
 
-    # Step G: Save the replay buffer
-    with open(REPLAY_BUFFER_FILE_STOCKFISH, "wb") as f:
-        pickle.dump(replay_buffer, f)
-    print(f"Replay buffer saved to {REPLAY_BUFFER_FILE_STOCKFISH}")
+        with open(replay_buffer_file, "wb") as f:
+            pickle.dump(replay_buffer, f)
+        print(f"Replay buffer saved to {replay_buffer_file}")
+
     print("All iterations complete!")
 
 
+###############################################################################
+# 5) Example Entry Point
+###############################################################################
 if __name__ == "__main__":
-    main_self_play_loop(
-        num_iterations=2,
-        games_per_iteration=300,
-        num_simulations=10,
-        model_path="/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/small_model/transformer/best_trained_model_training_against_stockfish.keras",
-        learning_rate=5e-4,
-        stockfish_ratio=0.9,
+    main_self_play_loop_parallel(
+        num_iterations=10,
+        games_per_iteration=50,
+        model_path="/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/small_model/transformer/my_engine_eval_model_100GB_of_parsed_games_depht_8_copy.keras",
+        replay_buffer_file="replay_buffer.pkl",
+        stockfish_games_ratio=0.2,
         stockfish_path="/Users/mateuszzieba/Desktop/dev/chess/stockfish/src/stockfish",
-        stockfish_params={"Skill Level": 5},
-        second_model_path=(
-            "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/small_model/transformer/best_trained_model_training_against_stockfish_copy.keras"
-        ),
-        second_model_ratio=0.0,
+        stockfish_params={"Skill Level": 15},
+        n_mcts_sims=50,
+        mcts_batch_size=25,
+        num_workers=6
     )

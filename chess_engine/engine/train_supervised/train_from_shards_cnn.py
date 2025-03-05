@@ -1,193 +1,241 @@
+
+import json
 import os
-import glob
-import numpy as np
 import tensorflow as tf
 from tensorflow.keras import Model, Input
+from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.layers import (
-    Dense, Conv2D, MaxPooling2D, Flatten, Dropout, Reshape
+    Dense,
+    Conv2D,
+    BatchNormalization,
+    Activation,
+    Add,
+    Flatten,
+    Dropout,
+    Reshape,
 )
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint  # <-- Import the checkpoint callback
+
+NUM_MOVES = 64 * 64 * 5  # from_sqr * 64 * 5 + to_sqr * 5 + promo_code
+BATCH_SIZE = 128
+EPOCHS = 2
+TRAIN_PATTERN = "engine_eval_tfrecords/train-*.tfrecord"
+VAL_PATTERN = "engine_eval_tfrecords/val-*.tfrecord"
 
 
-###############################################################################
-# 1. TFRecord Parsing
-###############################################################################
 def parse_tfrecord(serialized_example):
-    """
-    Parse a single TFRecord Example. Expects:
-      'board': raw bytes storing float32 [64,14]
-      'move':  int64 index in [0..4095]
-      'value': float in [-1..+1]
-
-    Returns: (board_tensor), (move_idx, value_label)
-      so we can feed it to a two‐head model: outputs = [policy_head, value_head].
-    """
-    feature_desc = {
-        'board': tf.io.FixedLenFeature([], tf.string),
-        'move': tf.io.FixedLenFeature([], tf.int64),
-        'value': tf.io.FixedLenFeature([], tf.float32),
+    feat_desc = {
+        "board": tf.io.FixedLenFeature([], tf.string),
+        "move": tf.io.FixedLenFeature([], tf.int64),
+        "value": tf.io.FixedLenFeature([], tf.float32),
     }
-    parsed = tf.io.parse_single_example(serialized_example, feature_desc)
+    parsed = tf.io.parse_single_example(serialized_example, feat_desc)
 
-    # Decode board
-    board_bytes = tf.io.decode_raw(parsed['board'], tf.float32)
-    board_tensor = tf.reshape(board_bytes, (64, 14))
+    board_bytes = tf.io.decode_raw(parsed["board"], tf.float32)
+    board_tensor = tf.reshape(board_bytes, (64, 68))
 
-    move_idx = parsed['move']
-    value_label = parsed['value']
+    move_idx = parsed["move"]
+    value_label = parsed["value"]
 
-    # Return (features, labels) with multi‐output model
     return board_tensor, (move_idx, value_label)
 
 
-###############################################################################
-# 2. CNN with Two Heads: Policy (4096) & Value (1)
-###############################################################################
-def create_alphazero_cnn():
+def residual_block(x, filters=128):
+    shortcut = x
+    x = Conv2D(filters, kernel_size=3, padding="same", use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = Conv2D(filters, kernel_size=3, padding="same", use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Add()([shortcut, x])
+    x = Activation("relu")(x)
+    return x
+
+
+def create_alphazero_cnn(
+    input_shape=(64, 68),
+    policy_size=NUM_MOVES,
+    num_filters=64,
+    num_res_blocks=8,
+    dense_units=512,
+):
     """
-    Builds a CNN trunk with two heads:
-      - policy_head: 4096‐way softmax for moves
-      - value_head: scalar in [-1..+1]
+    An AlphaZero‐style CNN with smaller default settings for demonstration.
+    Adjust as needed (more blocks, bigger dense layer, etc.).
     """
-    inputs = Input(shape=(64, 14), name="board_input")
+    inputs = Input(shape=input_shape, name="board_input")
+    # Reshape (64, 68) -> (8, 8, 68)
+    x = Reshape((8, 8, input_shape[-1]))(inputs)
 
-    x = Reshape((8, 8, 14))(inputs)  # Convert to 8x8 with 14 channels
+    # Initial convolution
+    x = Conv2D(num_filters, kernel_size=3, padding="same", use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
 
-    x = Conv2D(64, (3, 3), padding='same', activation='relu')(x)
-    x = Conv2D(64, (3, 3), padding='same', activation='relu')(x)
-    x = MaxPooling2D((2, 2))(x)  # -> shape (None,4,4,64)
+    # Residual blocks
+    for _ in range(num_res_blocks):
+        x = residual_block(x, filters=num_filters)
 
-    x = Conv2D(128, (3, 3), padding='same', activation='relu')(x)
-    x = Conv2D(128, (3, 3), padding='same', activation='relu')(x)
-    x = MaxPooling2D((2, 2))(x)  # -> shape (None,2,2,128)
-
-    x = Flatten()(x)  # shape ~ (None, 512)
-    x = Dense(512, activation='relu')(x)
+    x = Flatten()(x)
+    x = Dense(dense_units, activation="relu")(x)
     x = Dropout(0.2)(x)
 
-    # Policy head: output shape (4096), softmax
-    policy_head = Dense(4096, activation='softmax', name='policy_head')(x)
+    # Policy head: choose among 20,480 moves
+    policy_head = Dense(policy_size, activation="softmax", name="policy_head")(x)
 
-    # Value head: output shape (1), tanh to keep in [-1..+1]
-    value_head = Dense(1, activation='tanh', name='value_head')(x)
+    # Value head: single float in [-1,1], so use "tanh"
+    value_head = Dense(1, activation="tanh", name="value_head")(x)
 
     model = Model(inputs=inputs, outputs=[policy_head, value_head])
 
-    # Two separate losses:
-    #   policy_head -> sparse_categorical_crossentropy
-    #   value_head  -> mean squared error
     model.compile(
         optimizer=Adam(learning_rate=1e-4),
         loss={
-            'policy_head': 'sparse_categorical_crossentropy',
-            'value_head': 'mse'
+            "policy_head": "sparse_categorical_crossentropy",
+            "value_head": "mse",
         },
         loss_weights={
-            'policy_head': 1.0,
-            'value_head': 1.0
+            "policy_head": 1.0,
+            "value_head": 1.0,
         },
         metrics={
-            'policy_head': 'accuracy',
-            'value_head': 'mse'
-        }
+            "policy_head": "accuracy",
+            "value_head": "mse",
+        },
     )
-
     return model
 
 
-###############################################################################
-# 3. Main Training Logic
-###############################################################################
-def build_dataset_from_shards(file_pattern, batch_size, shuffle_buffer=50000, is_training=True):
-    """
-    Build a tf.data.Dataset from multiple TFRecord shards specified by file_pattern.
-    Example: file_pattern="data_tfrecords_sharded/train-*.tfrecord"
-
-    If is_training=True, we shuffle; otherwise we skip shuffle.
-    """
+def build_dataset_from_shards(file_pattern, batch_size, is_training=True):
     files_dataset = tf.data.Dataset.list_files(file_pattern, shuffle=is_training)
-
     dataset = files_dataset.interleave(
         lambda fname: tf.data.TFRecordDataset(fname),
-        cycle_length=4,  # how many files to read concurrently
+        cycle_length=1,
         num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=not is_training
+        deterministic=not is_training,
     )
 
+    shuffle_buffer = 10_000
     dataset = dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
-
     if is_training:
-        dataset = dataset.shuffle(buffer_size=shuffle_buffer)
-
+        dataset = dataset.shuffle(shuffle_buffer)
     dataset = dataset.batch(batch_size)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-
+    dataset = dataset.prefetch(2)
     return dataset
 
 
+def count_tfrecord_examples(file_pattern):
+    num_examples = 0
+    for filename in tf.io.gfile.glob(file_pattern):
+        for _ in tf.data.TFRecordDataset(filename):
+            num_examples += 1
+    return num_examples
+
+
+def get_or_compute_counts(train_pattern, val_pattern, cache_file="count.json"):
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                data = json.load(f)
+            if "train_count" in data and "val_count" in data:
+                print(f"Using cached counts from {cache_file}...")
+                return data["train_count"], data["val_count"]
+        except Exception as e:
+            print(f"Warning: could not read '{cache_file}', will re-compute. Reason: {e}")
+
+    print("Counting TFRecord examples from scratch...")
+    train_count = count_tfrecord_examples(train_pattern)
+    val_count = count_tfrecord_examples(val_pattern)
+    print(f"train_count = {train_count}, val_count = {val_count}")
+
+    data = {"train_count": train_count, "val_count": val_count}
+    with open(cache_file, "w") as f:
+        json.dump(data, f)
+    print(f"Counts saved to {cache_file}")
+
+    return train_count, val_count
+
+
 def main():
-    train_pattern = "data_tfrecords_sharded/train-*.tfrecord"
-    val_pattern = "data_tfrecords_sharded/val-*.tfrecord"
+    train_count, val_count = get_or_compute_counts(
+        train_pattern=TRAIN_PATTERN,
+        val_pattern=VAL_PATTERN,
+        cache_file="counts.json",
+    )
+    print("Train count:", train_count)
+    print("Val count:", val_count)
 
-    batch_size = 128
-    epochs = 5
+    steps_per_epoch = train_count // BATCH_SIZE
+    val_steps = val_count // BATCH_SIZE
 
-    print("Building training dataset from shards:", train_pattern)
-    train_dataset = build_dataset_from_shards(
-        file_pattern=train_pattern,
-        batch_size=batch_size,
-        shuffle_buffer=50000,
-        is_training=True
+    print(f"Steps per epoch (train) = {steps_per_epoch}")
+    print(f"Steps per epoch (val) = {val_steps}")
+
+    print("Building training dataset from:", TRAIN_PATTERN)
+    train_dataset = (
+        build_dataset_from_shards(
+            file_pattern=TRAIN_PATTERN,
+            batch_size=BATCH_SIZE,
+            is_training=True,
+        )
+        .repeat()
     )
 
-    print("Building validation dataset from shards:", val_pattern)
-    val_dataset = build_dataset_from_shards(
-        file_pattern=val_pattern,
-        batch_size=batch_size,
-        shuffle_buffer=1,  # minimal or no shuffle for validation
-        is_training=False
+    print("Building validation dataset from:", VAL_PATTERN)
+    val_dataset = (
+        build_dataset_from_shards(
+            file_pattern=VAL_PATTERN,
+            batch_size=BATCH_SIZE,
+            is_training=False,
+        )
+        .repeat()
     )
 
-    model_path = ""
-    if model_path and os.path.exists(model_path):
-        print(f"Loading existing model from {model_path}")
+    # Create or load model
+    model_path = (
+        "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/"
+        "chess_engine/engine/train_supervised/"
+        "my_engine_eval_model_100GB_of_parsed_games_depht_8.keras"
+    )
+    if os.path.exists(model_path):
+        print(f"Loading existing model from: {model_path}")
         model = tf.keras.models.load_model(model_path)
     else:
-        print("Creating a fresh AlphaZero‐style CNN...")
-        model = create_alphazero_cnn()
+        print("Creating a fresh AlphaZero‐style CNN.")
+        model = create_alphazero_cnn(
+            input_shape=(64, 68),
+            policy_size=NUM_MOVES,
+            num_filters=128,
+            num_res_blocks=8,
+            dense_units=512,
+        )
+        model.summary()
 
-    model.summary()
-
-    # ----------------------------------------------------------------------
-    # 4. Create a checkpoint callback to save the model after each epoch
-    # ----------------------------------------------------------------------
-    checkpoint_dir = "./checkpoints"
+    checkpoint_dir = "./checkpoints_engine_eval"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     checkpoint_callback = ModelCheckpoint(
-        filepath=os.path.join(checkpoint_dir, "epoch_{epoch:02d}_valLoss_{val_loss:.4f}.keras"),
-        save_freq='epoch',
-        save_weights_only=False,  # set to True if you only want weights
-        monitor='val_loss',  # or you could monitor 'val_policy_head_loss' if you prefer
-        mode='min',
-        save_best_only=False  # set to True if you only want to save the best epoch
+        filepath=os.path.join(
+            checkpoint_dir, "ckpt_epoch_{epoch:02d}_valLoss_{val_loss:.4f}.keras"
+        ),
+        save_freq="epoch",
+        save_weights_only=False,
+        monitor="val_loss",
+        mode="min",
+        save_best_only=False,
     )
 
-    # ----------------------------------------------------------------------
-    # 5. Train with callbacks
-    # ----------------------------------------------------------------------
     model.fit(
         train_dataset,
         validation_data=val_dataset,
-        epochs=epochs,
-        callbacks=[checkpoint_callback]  # Pass checkpoint to callbacks
+        epochs=EPOCHS,
+        callbacks=[checkpoint_callback],
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=val_steps,
     )
 
-    # Save final model (if you still want a single file at end)
-    save_model_path = "./alphazero_cnn_model.keras"
-    model.save(save_model_path)
-    print(f"Model fully saved to {save_model_path}")
+    model.save(model_path)
+    print(f"Final model saved to: {model_path}")
 
 
 if __name__ == "__main__":

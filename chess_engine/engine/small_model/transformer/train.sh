@@ -7,7 +7,7 @@ if [[ ! -f "train.py" ]]; then
 fi
 export PYTHONPATH=/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api
 # Loop to execute train.py 10 times
-for i in {1..8}
+for i in {1..10}
 do
   echo "Execution $i of train.py"
   python3 train.py
