@@ -1,16 +1,16 @@
 import os
 import random
 import pickle
+import time
 from collections import deque
 import concurrent.futures
-import time
 
 import chess
 import chess.engine
 import numpy as np
 import tensorflow as tf
 
-from chess_api.mcts import run_mcts_batched, encode_node_4frames, MCTSNode
+from chess_api.mcts import run_mcts_batched, MCTSNode
 from chess_engine.engine.train_supervised.parse_pgn_alpha0 import (
     encode_single_board,
     move_to_index
@@ -77,7 +77,7 @@ def init_worker(model_path):
     if MODEL is None:
         print(f"Worker {os.getpid()} is loading model from: {model_path}")
         loaded_model = tf.keras.models.load_model(model_path, compile=False)
-        # IMPORTANT: Use sparse CE, since we store single integer labels:
+        # Use sparse CE, since we store single integer labels:
         loaded_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
             loss=["sparse_categorical_crossentropy", "mean_squared_error"]
@@ -108,7 +108,7 @@ def self_play_game_batched(
     forced_index = 0
 
     positions = []
-    while not board.is_game_over() and len(board.move_stack) < 600:
+    while not board.is_game_over() and len(board.move_stack) < 300:
         # If we still have forced moves left:
         if forced_line and forced_index < len(forced_line):
             next_san = forced_line[forced_index]
@@ -118,10 +118,8 @@ def self_play_game_batched(
                 forced_move = None
 
             if forced_move and forced_move in board.legal_moves:
-                enc = encode_node_4frames(MCTSNode(board=board), max_frames=4)
-                # Single-integer label:
+                enc = encode_single_board(board)
                 forced_move_idx = move_to_index(forced_move)
-
                 side_is_white = board.turn
                 positions.append((enc, forced_move_idx, side_is_white))
 
@@ -131,19 +129,13 @@ def self_play_game_batched(
             else:
                 forced_line = None
 
-        # If no forced move => run MCTS normally
-        node = MCTSNode(board=board)
-        enc = encode_node_4frames(node, max_frames=4)
-        best_move, _policy_dist = run_mcts_batched(
-            model=model,
-            root_board=board,
-            n_simulations=n_mcts_sims,
-            batch_size=mcts_batch_size,
-            temperature=0.4,
-            add_dirichlet_noise=add_dirichlet_noise,
-            dirichlet_alpha=dirichlet_alpha,
-            dirichlet_epsilon=dirichlet_epsilon
-        )
+        # If no forced move => run MCTS
+        enc = encode_single_board(board)
+        best_move = run_mcts_batched(model, board, n_simulations=n_mcts_sims, batch_size=mcts_batch_size,
+                                     temperature=0.4,
+                                     add_dirichlet_noise=add_dirichlet_noise,
+                                     dirichlet_alpha=dirichlet_alpha,
+                                     dirichlet_epsilon=dirichlet_epsilon)
         if best_move is None:
             break
 
@@ -221,9 +213,8 @@ def play_game_vs_stockfish_batched(
                     forced_line = None
 
             if forced_move:
-                enc = encode_node_4frames(MCTSNode(board=board), max_frames=4)
+                enc = encode_single_board(board)
                 forced_move_idx = move_to_index(forced_move)
-
                 side_white = board.turn
                 model_positions.append((enc, forced_move_idx, side_white))
 
@@ -232,18 +223,12 @@ def play_game_vs_stockfish_batched(
 
             else:
                 # MCTS
-                node = MCTSNode(board=board)
-                enc = encode_node_4frames(node, max_frames=4)
-                best_move, _policy_dist = run_mcts_batched(
-                    model=model,
-                    root_board=board,
-                    n_simulations=n_mcts_sims,
-                    batch_size=mcts_batch_size,
-                    temperature=0.2,
-                    add_dirichlet_noise=add_dirichlet_noise,
-                    dirichlet_alpha=dirichlet_alpha,
-                    dirichlet_epsilon=dirichlet_epsilon
-                )
+                _node = MCTSNode(board=board)
+                enc = encode_single_board(board)
+                best_move = run_mcts_batched(model, board, n_simulations=n_mcts_sims, batch_size=mcts_batch_size, temperature=0.0,
+    add_dirichlet_noise=False,
+    dirichlet_alpha=dirichlet_alpha,
+    dirichlet_epsilon=dirichlet_epsilon)
                 if best_move is None:
                     break
 
@@ -254,8 +239,8 @@ def play_game_vs_stockfish_batched(
 
         else:
             # Stockfish's turn
-            sf_node = MCTSNode(board=board)
-            sf_enc = encode_node_4frames(sf_node, max_frames=4)
+            _sf_node = MCTSNode(board=board)
+            sf_enc = encode_single_board(board)
 
             sf_move = engine.play(board, chess.engine.Limit(depth=1)).move
             if sf_move is None or not board.is_legal(sf_move):
@@ -293,12 +278,12 @@ def play_game_vs_stockfish_batched(
 
     # Combine positions
     training_data = []
-    # Model moves (label from the model's perspective):
+    # Model moves (label from the model's perspective)
     for (enc, move_idx, side_is_white) in model_positions:
         val = outcome_for_model if (side_is_white == model_is_white) else -outcome_for_model
         training_data.append((enc, move_idx, val))
 
-    # Stockfish moves (label from White's perspective):
+    # Stockfish moves (label from White's perspective)
     for (enc, move_idx, side_is_white) in sf_positions:
         val_sf = white_score if side_is_white == chess.WHITE else -white_score
         training_data.append((enc, move_idx, val_sf))
@@ -330,7 +315,7 @@ def run_one_game_in_worker(
             stockfish_params=stockfish_params,
             n_mcts_sims=n_mcts_sims,
             mcts_batch_size=mcts_batch_size,
-            opening_prob=0,
+            opening_prob=0.3,
             add_dirichlet_noise=False,
             dirichlet_alpha=0.1,
             dirichlet_epsilon=0.1
@@ -342,7 +327,7 @@ def run_one_game_in_worker(
             model=MODEL,
             n_mcts_sims=n_mcts_sims,
             mcts_batch_size=mcts_batch_size,
-            opening_prob=0.7,
+            opening_prob=0.3,
             add_dirichlet_noise=True,
             dirichlet_alpha=0.3,
             dirichlet_epsilon=0.3
@@ -370,8 +355,8 @@ def train_model(model, training_data, batch_size=64, epochs=3):
         policy_moves.append(move_idx)
         value_labels.append(val)
 
-    x = np.array(boards, dtype=np.float32)           # shape (N, 64, 14*frames) or similar
-    y_pol = np.array(policy_moves, dtype=np.int32)   # shape (N,); single integer label
+    x = np.array(boards, dtype=np.float32)           # shape (N, 64, 17)
+    y_pol = np.array(policy_moves, dtype=np.int32)   # shape (N,)
     y_val = np.array(value_labels, dtype=np.float32).reshape(-1, 1)  # shape (N,1)
 
     hist = model.fit(
@@ -415,7 +400,7 @@ def main_self_play_loop_parallel(
 
     print(f"Loading initial model from: {model_path}")
     init_model = tf.keras.models.load_model(model_path, compile=False)
-    # Use sparse CE here as well:
+    # Use sparse CE here as well
     init_model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
         loss=["sparse_categorical_crossentropy", "mean_squared_error"]
@@ -463,11 +448,11 @@ def main_self_play_loop_parallel(
         print(f"Replay buffer size is now {len(replay_buffer)}")
 
         # Sample from replay buffer
-        if len(replay_buffer) < 50000:
+        if len(replay_buffer) < 60000:
             sample_data = list(replay_buffer)
             print(f"Using all {len(sample_data)} samples (buffer < 50k).")
         else:
-            sample_data = random.sample(replay_buffer, 50000)
+            sample_data = random.sample(replay_buffer, 60000)
             print(f"Sampled 50,000 positions from buffer of size {len(replay_buffer)}.")
 
         # Reload model & train
@@ -478,7 +463,7 @@ def main_self_play_loop_parallel(
             loss=["sparse_categorical_crossentropy", "mean_squared_error"]
         )
         print(f"Training on {len(sample_data)} samples...")
-        train_model(model, sample_data, batch_size=256, epochs=3)
+        train_model(model, sample_data, batch_size=256, epochs=4)
 
         # Save model & replay buffer
         model.save(model_path)
@@ -496,13 +481,13 @@ def main_self_play_loop_parallel(
 ###############################################################################
 if __name__ == "__main__":
     main_self_play_loop_parallel(
-        num_iterations=10,
-        games_per_iteration=50,
-        model_path="/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/small_model/transformer/my_engine_eval_model_100GB_of_parsed_games_depht_8_copy.keras",
+        num_iterations=15,
+        games_per_iteration=100,
+        model_path="/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/small_model/transformer/my_engine_eval_model_20GB_of_parsed_games_pure_argmax_12_epoch_128batch_copy.keras",
         replay_buffer_file="replay_buffer.pkl",
         stockfish_games_ratio=0.2,
         stockfish_path="/Users/mateuszzieba/Desktop/dev/chess/stockfish/src/stockfish",
-        stockfish_params={"Skill Level": 15},
+        stockfish_params={"Skill Level": 5},
         n_mcts_sims=50,
         mcts_batch_size=25,
         num_workers=6

@@ -1,7 +1,7 @@
-
 import json
 import os
 import tensorflow as tf
+
 from tensorflow.keras import Model, Input
 from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.layers import (
@@ -16,11 +16,12 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 
-NUM_MOVES = 64 * 64 * 5  # from_sqr * 64 * 5 + to_sqr * 5 + promo_code
-BATCH_SIZE = 128
+NUM_MOVES = 64 * 64 * 5
+BATCH_SIZE = 512
 EPOCHS = 2
-TRAIN_PATTERN = "engine_eval_tfrecords/train-*.tfrecord"
-VAL_PATTERN = "engine_eval_tfrecords/val-*.tfrecord"
+
+TRAIN_PATTERN = "my_refactored_tfrecords/train-*.tfrecord"
+VAL_PATTERN = "my_refactored_tfrecords/val-*.tfrecord"
 
 
 def parse_tfrecord(serialized_example):
@@ -31,12 +32,12 @@ def parse_tfrecord(serialized_example):
     }
     parsed = tf.io.parse_single_example(serialized_example, feat_desc)
 
+    # Decode the board bytes as float32 and reshape to (64, 17)
     board_bytes = tf.io.decode_raw(parsed["board"], tf.float32)
-    board_tensor = tf.reshape(board_bytes, (64, 68))
+    board_tensor = tf.reshape(board_bytes, (64, 17))
 
     move_idx = parsed["move"]
     value_label = parsed["value"]
-
     return board_tensor, (move_idx, value_label)
 
 
@@ -53,18 +54,22 @@ def residual_block(x, filters=128):
 
 
 def create_alphazero_cnn(
-    input_shape=(64, 68),
-    policy_size=NUM_MOVES,
-    num_filters=64,
-    num_res_blocks=8,
-    dense_units=512,
+        input_shape=(64, 17),
+        policy_size=NUM_MOVES,
+        num_filters=64,
+        num_res_blocks=8,
+        dense_units=512,
 ):
     """
     An AlphaZero‐style CNN with smaller default settings for demonstration.
     Adjust as needed (more blocks, bigger dense layer, etc.).
+
+    input_shape: (64, 17) for a single board frame of 64 squares × 17 planes.
+    This is reshaped internally to (8, 8, 17).
     """
     inputs = Input(shape=input_shape, name="board_input")
-    # Reshape (64, 68) -> (8, 8, 68)
+
+    # Reshape (64, 17) -> (8, 8, 17)
     x = Reshape((8, 8, input_shape[-1]))(inputs)
 
     # Initial convolution
@@ -83,11 +88,10 @@ def create_alphazero_cnn(
     # Policy head: choose among 20,480 moves
     policy_head = Dense(policy_size, activation="softmax", name="policy_head")(x)
 
-    # Value head: single float in [-1,1], so use "tanh"
+    # Value head: single float in [-1,1]
     value_head = Dense(1, activation="tanh", name="value_head")(x)
 
     model = Model(inputs=inputs, outputs=[policy_head, value_head])
-
     model.compile(
         optimizer=Adam(learning_rate=1e-4),
         loss={
@@ -108,17 +112,19 @@ def create_alphazero_cnn(
 
 def build_dataset_from_shards(file_pattern, batch_size, is_training=True):
     files_dataset = tf.data.Dataset.list_files(file_pattern, shuffle=is_training)
+
     dataset = files_dataset.interleave(
         lambda fname: tf.data.TFRecordDataset(fname),
         cycle_length=1,
         num_parallel_calls=tf.data.AUTOTUNE,
         deterministic=not is_training,
     )
-
     shuffle_buffer = 10_000
     dataset = dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+
     if is_training:
         dataset = dataset.shuffle(shuffle_buffer)
+
     dataset = dataset.batch(batch_size)
     dataset = dataset.prefetch(2)
     return dataset
@@ -195,15 +201,15 @@ def main():
     model_path = (
         "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/"
         "chess_engine/engine/train_supervised/"
-        "my_engine_eval_model_100GB_of_parsed_games_depht_8.keras"
+        "my_engine_eval_model_100GB_of_parsed_games_pure_argmax.keras"
     )
     if os.path.exists(model_path):
         print(f"Loading existing model from: {model_path}")
         model = tf.keras.models.load_model(model_path)
     else:
-        print("Creating a fresh AlphaZero‐style CNN.")
+        print("Creating a fresh AlphaZero‐style CNN (single‐frame).")
         model = create_alphazero_cnn(
-            input_shape=(64, 68),
+            input_shape=(64, 17),  # single board frame
             policy_size=NUM_MOVES,
             num_filters=128,
             num_res_blocks=8,
@@ -216,7 +222,8 @@ def main():
 
     checkpoint_callback = ModelCheckpoint(
         filepath=os.path.join(
-            checkpoint_dir, "ckpt_epoch_{epoch:02d}_valLoss_{val_loss:.4f}.keras"
+            checkpoint_dir,
+            "ckpt_epoch_{epoch:02d}_valLoss_{val_loss:.4f}.keras"
         ),
         save_freq="epoch",
         save_weights_only=False,

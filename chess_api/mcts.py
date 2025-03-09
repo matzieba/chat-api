@@ -1,17 +1,20 @@
 import chess
 import numpy as np
-from chess_engine.engine.train_supervised.parse_pgn_alpha0 import move_to_index, encode_single_board
+from chess_engine.engine.train_supervised.parse_pgn_alpha0 import (
+    move_to_index,
+    encode_single_board
+)
 
 
 class MCTSNode:
     """
-    A single node in the MCTS tree for AlphaZero‐style search.
+    A single node in the MCTS tree for an AlphaZero‐style search.
     """
     __slots__ = [
-        'board',  # chess.Board for this node's position
-        'parent',  # parent MCTSNode
-        'children',  # dict[move -> MCTSNode]
-        'prior',  # prior probability (from the NN policy)
+        'board',      # chess.Board for this node's position
+        'parent',     # parent MCTSNode
+        'children',   # dict[move -> MCTSNode]
+        'prior',      # prior probability (from the NN policy)
         'visit_count',
         'value_sum',
         'is_terminal'
@@ -36,7 +39,7 @@ class MCTSNode:
     @property
     def u_value(self):
         # Upper Confidence Bound
-        c_puct = 2.5  # typical in AlphaZero is 1.5
+        c_puct = 2.5  # typical AlphaZero might use 1.5..2.5
         if self.parent is None:
             return 0  # root has no parent
         return c_puct * self.prior * np.sqrt(self.parent.visit_count) / (1 + self.visit_count)
@@ -54,39 +57,15 @@ class MCTSNode:
         return best_child
 
 
-def encode_node_4frames(node, max_frames=4):
-    """
-    Climbs up the node's ancestors to gather up to 'max_frames' boards,
-    from oldest to newest. Each is encoded to shape (64,17), then concatenated
-    into (64,17*max_frames) = (64,68). Zero-pad if fewer than max_frames.
-    """
-    boards = []
-    cur = node
-    while cur is not None and len(boards) < max_frames:
-        boards.append(cur.board)
-        cur = cur.parent
-    boards.reverse()  # oldest -> newest
-
-    frames = []
-    missing = max_frames - len(boards)
-    for _ in range(missing):
-        frames.append(np.zeros((64, 17), dtype=np.float32))
-    for b in boards:
-        frames.append(encode_single_board(b))
-    return np.concatenate(frames, axis=1)  # shape (64, 17*max_frames)
-
-
-###############################################################################
-# Terminal value: for a game_over position
-###############################################################################
 def terminal_value(board: chess.Board) -> float:
     """
-    Returns a value in [-1..+1] if board is terminal.
-    +1 if White has won, -1 if Black has won, 0 for a draw.
-    This is from White's perspective.
+    Returns a value in [-1..+1] if board is terminal, from White's perspective:
+      +1 if White has won,
+      -1 if Black has won,
+       0 if draw (or not terminal).
     """
     if not board.is_game_over():
-        return 0.0  # not terminal
+        return 0.0
     result = board.result()  # e.g. "1-0", "0-1", "1/2-1/2"
     if result == "1-0":
         return 1.0
@@ -96,53 +75,43 @@ def terminal_value(board: chess.Board) -> float:
         return 0.0
 
 
-###############################################################################
-# Backprop
-###############################################################################
 def backprop(node: MCTSNode, leaf_value: float):
     """
-    Propagate the evaluation up the tree. If you want side-to-move perspective,
-    you can flip sign each step (commented out below). Example here is from
-    White's perspective only.
+    Propagate the evaluation up the tree.
+    If you wanted side-to-move perspective, you could flip signs; here it is from White's perspective.
     """
     cur = node
-    # sign = 1.0  # if flipping, you'd do sign flips each step
     while cur is not None:
         cur.visit_count += 1
-        cur.value_sum += leaf_value  # * sign
-        # sign = -sign
+        cur.value_sum += leaf_value
         cur = cur.parent
 
 
-###############################################################################
-# Batched MCTS with Dirichlet noise & Temperature
-###############################################################################
 def run_mcts_batched(
-        model,
-        root_board: chess.Board,
-        n_simulations=100,
-        batch_size=32,
-        temperature=1.0,
-        add_dirichlet_noise=False,
-        dirichlet_alpha=0.03,
-        dirichlet_epsilon=0.25
+    model,
+    root_board: chess.Board,
+    n_simulations=100,
+    batch_size=32,
+    temperature=1.0,
+    add_dirichlet_noise=False,
+    dirichlet_alpha=0.03,
+    dirichlet_epsilon=0.25
 ):
     """
-    Perform MCTS simulations, optionally applying Dirichlet noise to the
-    root node's prior, then pick a move from the root according to the
-    temperature. Returns (chosen_move, (policy distribution over 20480 moves)).
+    Perform MCTS simulations, optionally applying Dirichlet noise to the root node's prior.
+    Afterwards, choose a move from the root according to the temperature and return only the best_move.
     """
     root_node = MCTSNode(board=root_board.copy(), parent=None, prior=1.0)
     expansions_done = 0
-    root_expanded = False  # Track if we've expanded the root once
+    root_expanded = False  # track if we've expanded the root once
 
     while expansions_done < n_simulations:
+        # Collect leaves needing expansion in a mini‐batch
         leaf_nodes = []
-        # Collect up to 'batch_size' leaves needing expansion
         while len(leaf_nodes) < batch_size and expansions_done < n_simulations:
             node = root_node
 
-            # (A) Selection: descend tree
+            # (A) Selection: descend the tree
             while node.children and not node.is_terminal:
                 node = node.best_child_for_selection
 
@@ -157,19 +126,20 @@ def run_mcts_batched(
             leaf_nodes.append(node)
             expansions_done += 1
 
-        if len(leaf_nodes) == 0:
-            # no expansions needed (maybe all terminal)
+        if not leaf_nodes:
+            # Possibly no expansions needed if everything is terminal
             continue
 
-        # (B) Evaluate in a single batch
+        # (B) Evaluate the leaf nodes in a single batch
         leaf_enc_list = []
         for ln in leaf_nodes:
-            enc_4f = encode_node_4frames(ln, max_frames=4)
-            leaf_enc_list.append(enc_4f)
+            # Single‐board encoding
+            enc_single = encode_single_board(ln.board)
+            leaf_enc_list.append(enc_single)
 
-        leaf_enc_array = np.array(leaf_enc_list, dtype=np.float32)  # (B,64,68)
+        leaf_enc_array = np.array(leaf_enc_list, dtype=np.float32)  # shape => (B,64,17)
         policy_batch, value_batch = model.predict(leaf_enc_array, verbose=0)
-        # policy_batch.shape => (B, 20480)
+        # policy_batch.shape => (B, NUM_MOVES=20480)
         # value_batch.shape  => (B, 1)
 
         # (C) Expansion + Backprop
@@ -179,7 +149,7 @@ def run_mcts_batched(
 
             legal_moves = list(node.board.legal_moves)
             if not legal_moves:
-                # no moves => terminal
+                # No moves => terminal
                 tv = terminal_value(node.board)
                 backprop(node, tv)
                 continue
@@ -197,7 +167,7 @@ def run_mcts_batched(
             for mv in priors:
                 priors[mv] /= total_p
 
-            # (Optional) Apply Dirichlet noise if this is the first time we expand the root
+            # Apply Dirichlet noise once if at the root
             if add_dirichlet_noise and node is root_node and not root_expanded:
                 alpha_vec = [dirichlet_alpha] * len(legal_moves)
                 noise = np.random.dirichlet(alpha_vec)
@@ -219,44 +189,37 @@ def run_mcts_batched(
             # Backprop the leaf value
             backprop(node, leaf_value)
 
-    # If no children at root => no moves
+    # If no children at root => no legal moves => return None
     if not root_node.children:
-        return None, None
+        return None
 
-    # Build final distribution from visit counts
-    distribution = np.zeros(20480, dtype=np.float32)
-    move_visit_counts = {}
+    # Build a visit-count list so we can pick a final move via temperature
+    move_list = []
+    visits_list = []
     for mv, child in root_node.children.items():
-        idx = move_to_index(mv)
-        distribution[idx] = child.visit_count
-        move_visit_counts[mv] = child.visit_count
+        move_list.append(mv)
+        visits_list.append(child.visit_count)
 
-    sum_visits = np.sum(distribution)
-    if sum_visits > 1e-8:
-        distribution /= sum_visits
+    sum_visits = float(np.sum(visits_list))
+    if sum_visits < 1e-8:
+        # No valid expansions or all zero
+        return None
 
-    # (D) Use temperature to pick the final move from the root
+    # Temperature sampling
     if temperature < 1e-8:
-        # ~Argmax selection
-        best_move = max(move_visit_counts, key=move_visit_counts.get)
+        # Argmax selection
+        best_idx = np.argmax(visits_list)
+        best_move = move_list[best_idx]
     else:
-        # Sample from distribution^(1/temperature)
-        dist_pow = distribution ** (1.0 / temperature)
-        dist_pow_sum = np.sum(dist_pow)
+        dist = np.array(visits_list, dtype=np.float32) / sum_visits
+        dist_pow = dist ** (1.0 / temperature)
+        dist_pow_sum = dist_pow.sum()
         if dist_pow_sum < 1e-8:
             # fallback to argmax
-            best_move = max(move_visit_counts, key=move_visit_counts.get)
+            best_idx = np.argmax(visits_list)
         else:
             dist_pow /= dist_pow_sum
-            # Sample an index
-            move_idx = np.random.choice(len(dist_pow), p=dist_pow)
-            # Map index back to the corresponding move
-            # We'll invert the dictionary or just do a second pass
-            # But more straightforward to loop again:
-            best_move = None
-            for mv, child in root_node.children.items():
-                if move_to_index(mv) == move_idx:
-                    best_move = mv
-                    break
+            best_idx = np.random.choice(len(move_list), p=dist_pow)
+        best_move = move_list[best_idx]
 
-    return best_move, distribution
+    return best_move

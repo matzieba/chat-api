@@ -1,3 +1,4 @@
+import random
 
 import tensorflow as tf
 from django.db import transaction
@@ -10,7 +11,7 @@ from chess_api.mcts import run_mcts_batched
 from chess_api.models import ChessGame
 
 
-MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/train_supervised/checkpoints_engine_eval/ckpt_epoch_01_valLoss_4.4988.keras"
+MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/train_supervised/my_engine_eval_model_100GB_of_parsed_games_pure_argmax.keras"
 model = tf.keras.models.load_model(MODEL_PATH)
 
 
@@ -101,7 +102,7 @@ class GameViewSet(viewsets.ModelViewSet):
         return "ongoing"
 
     def get_model_move(self, board: chess.Board) -> chess.Move:
-        best_move, _ = run_mcts_batched(model, board, n_simulations=50, batch_size=25)
+        best_move = run_mcts_batched(model, board, n_simulations=24, batch_size=12)
         return best_move
         # legal_moves_list = list(board.legal_moves)
         # return random.choice(legal_moves_list)

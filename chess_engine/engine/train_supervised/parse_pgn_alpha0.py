@@ -3,7 +3,6 @@ import random
 
 import chess
 import chess.pgn
-import chess.engine
 import numpy as np
 import tensorflow as tf
 
@@ -76,45 +75,6 @@ def encode_single_board(board: chess.Board) -> np.ndarray:
     return enc
 
 
-class BoardHistory:
-    """
-    Maintains a rolling window of up to N board encodings.
-    Each call to push(board) appends the encoded board state.
-    get_encoded() returns a (64, 17*N) array, padding with zeros if fewer than N.
-    """
-
-    def __init__(self, num_frames=4):
-        self.num_frames = num_frames
-        self.frames = []
-
-    def push(self, board: chess.Board):
-        enc = encode_single_board(board)
-        self.frames.append(enc)
-        # Keep only the last num_frames boards
-        while len(self.frames) > self.num_frames:
-            self.frames.pop(0)
-
-    def get_encoded(self) -> np.ndarray:
-        """
-        Returns shape (64, 17 * num_frames).
-        If the game hasn't had that many moves yet, zero-pad the missing frames.
-        """
-        current_count = len(self.frames)
-        missing = self.num_frames - current_count
-        padded = []
-
-        # Zero-fill for missing frames
-        for _ in range(missing):
-            padded.append(np.zeros((64, 17), dtype=np.float32))
-
-        # Then the actual frames, from oldest to newest
-        padded.extend(self.frames)
-
-        # Concatenate along the plane dimension (axis=1)
-        # So we get shape (64, 17 * num_frames)
-        return np.concatenate(padded, axis=1)
-
-
 def move_to_index(move: chess.Move) -> int:
     """
     Convert chess.Move to an integer in [0, 20480).
@@ -138,23 +98,9 @@ def move_to_index(move: chess.Move) -> int:
     )
 
 
-def convert_cp_to_value(score_cp: float, clamp=1000.0) -> float:
-    """
-    Convert centipawn score in [-∞, +∞] to [-1.0..+1.0],
-    saturating at ±clamp.
-    """
-    if score_cp > clamp:
-        return 1.0
-    elif score_cp < -clamp:
-        return -1.0
-    else:
-        return score_cp / clamp
-
-
 def create_example(board_array, move_idx, value):
     """
-    TFRecord Example creation.
-    board_array is a (64, 17 * N) float array if using N frames.
+    TFRecord Example creation. The board_array is a (64, 17) float array.
     """
     board_bytes = board_array.tobytes()
     features = {
@@ -239,23 +185,38 @@ def write_shard(
     return total_bytes_written, wrote_anything, stop_parsing
 
 
+def parse_game_result(result_str: str) -> float:
+    """
+    Converts a PGN result string to a final outcome from White's perspective:
+      "1-0" => +1.0
+      "0-1" => -1.0
+      "1/2-1/2" => 0.0
+    Returns None if not recognized (e.g. '*').
+    """
+    if result_str == "1-0":
+        return 1.0
+    elif result_str == "0-1":
+        return -1.0
+    elif result_str == "1/2-1/2":
+        return 0.0
+    else:
+        return None
+
+
 def parse_pgn_files_sharded(
     pgn_paths,
     output_dir="data_tfrecords_sharded",
     shard_buffer_size=50000,
     val_split=0.2,
     limit=None,
-    max_total_bytes=MAX_TOTAL_BYTES,
-    engine_path="/path/to/stockfish",
-    engine_depth=5
+    max_total_bytes=MAX_TOTAL_BYTES
 ):
     """
-    Reads PGN files, but uses Stockfish as "teacher":
-      - For each position, we query Stockfish for:
-          (a) best_move for the policy label
-          (b) numeric eval for the value label
-      - Then we store (position, best_move_idx, Stockfish_eval) in TFRecords.
-      - We now collect 4 frames of board history for each position.
+    Reads PGN files without any engine evaluation:
+      - For each position, we use the next move from the PGN as the policy label.
+      - The value label is the final game outcome from the perspective
+        of the side to move at that position.
+      - Only a single board snapshot is saved for each position (no multi-frame).
     """
     os.makedirs(output_dir, exist_ok=True)
     sample_buffer = []
@@ -263,11 +224,6 @@ def parse_pgn_files_sharded(
     shard_index = 0
     total_bytes_written = 0
     stop_parsing = False
-
-    # 1) Launch engine
-    print(f"Initializing engine from: {engine_path}")
-    engine = chess.engine.SimpleEngine.popen_uci(engine_path)
-    engine_limit = chess.engine.Limit(depth=engine_depth)
 
     def flush_buffer():
         nonlocal shard_index, sample_buffer, total_bytes_written, stop_parsing
@@ -295,7 +251,6 @@ def parse_pgn_files_sharded(
             return False
         return True
 
-    # 2) Iterate pgn files
     for pgn_file in pgn_paths:
         if stop_parsing:
             break
@@ -309,67 +264,45 @@ def parse_pgn_files_sharded(
                 if game is None:
                     break  # no more games
 
-                # Skip incomplete or weird results if you like
                 result_str = game.headers.get("Result", "*")
-                if result_str not in ["1-0", "0-1", "1/2-1/2"]:
+                final_outcome_white = parse_game_result(result_str)
+                if final_outcome_white is None:
+                    # Skip games with unrecognized or incomplete results
                     continue
 
                 board = game.board()
-                board_history = BoardHistory(num_frames=4)
 
-                # Step through the mainline moves
-                # but use Stockfish for the policy label
+                # Step through all moves in the main line
                 for move in game.mainline_moves():
-                    # 1) Add the current board to the history
-                    board_history.push(board)
+                    # Encode the current board
+                    encoded_board = encode_single_board(board)
 
-                    # 2) Evaluate the current position with the engine
-                    try:
-                        info = engine.analyse(board, engine_limit)
-                        pov_score = info["score"].pov(board.turn)
+                    # The next move from the PGN is the "policy" label
+                    move_idx = move_to_index(move)
+                    if 0 <= move_idx < NUM_MOVES:
+                        # Value label from perspective of side to move
+                        side_mult = 1.0 if board.turn == chess.WHITE else -1.0
+                        value_label = side_mult * final_outcome_white
 
-                        if pov_score.is_mate():
-                            mate_in = pov_score.mate()
-                            eval_cp = 1000 if mate_in > 0 else -1000
-                        else:
-                            eval_cp = pov_score.score()
+                        sample_buffer.append(
+                            (encoded_board, move_idx, value_label)
+                        )
 
-                        value_label = convert_cp_to_value(eval_cp, clamp=1000.0)
-                        best_move = engine.play(board, engine_limit).move
+                        if len(sample_buffer) >= shard_buffer_size:
+                            keep_going = flush_buffer()
+                            if not keep_going:
+                                break
 
-                        if best_move is None:
-                            # In rare cases, engine might fail
-                            continue
-
-                        best_move_idx = move_to_index(best_move)
-                        if 0 <= best_move_idx < NUM_MOVES:
-                            board_arr_4frames = board_history.get_encoded()
-                            sample_buffer.append(
-                                (board_arr_4frames, best_move_idx, value_label)
-                            )
-
-                            # If the buffer is large, flush
-                            if len(sample_buffer) >= shard_buffer_size:
-                                keep_going = flush_buffer()
-                                if not keep_going:
-                                    break
-                    except Exception as e:
-                        print(f"Engine analysis error: {e}")
-                        continue
-
-                    # 5) Push the PGN move to proceed
+                    # Push move to advance the board
                     board.push(move)
 
                 games_processed += 1
                 if limit is not None and games_processed >= limit:
                     break
 
-    # 3) Flush leftover samples
+    # Flush leftover samples
     if sample_buffer and not stop_parsing:
         flush_buffer()
-
-    # 4) Clean up
-    engine.quit()
 
     print(f"\nDone. Parsed {games_processed} games total.")
     print(f"Total bytes written: {total_bytes_written}")
@@ -380,19 +313,17 @@ def parse_pgn_files_sharded(
 
 
 if __name__ == "__main__":
+    # Example usage with the same PGN file paths.
     pgn_files = [
-        "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/"
-        "chess_engine/engine/games_data/lichess_elite_2023-01.pgn"
+        "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/games_data/lichess_elite_2023-01.pgn",
+        "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/games_data/lichess_elite_2023-11.pgn",
+        "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/games_data_1/lichess_elite_2021-02.pgn",
     ]
     parse_pgn_files_sharded(
         pgn_paths=pgn_files,
-        output_dir="engine_eval_tfrecords",
+        output_dir="my_refactored_tfrecords",
         shard_buffer_size=20000,
         val_split=0.2,
         limit=None,
-        max_total_bytes=100 * 1024**3,
-        engine_path=(
-            "/Users/mateuszzieba/Desktop/dev/chess/stockfish/src/stockfish"
-        ),
-        engine_depth=3
+        max_total_bytes=100 * 1024**3
     )
