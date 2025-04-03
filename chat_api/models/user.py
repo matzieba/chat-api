@@ -20,9 +20,6 @@ class User(AbstractUser):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     job_title = models.CharField(max_length=1024, blank=True, null=True)
-    profile_picture = models.ImageField(
-        upload_to="user_profile_picture", null=True, blank=True
-    )
 
     def __str__(self):
         return f"{self.first_name} {self.last_name or ''} - {self.id}"
