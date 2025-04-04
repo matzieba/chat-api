@@ -1,15 +1,17 @@
-FROM python:3.11.7-slim-bookworm
+FROM python:3.12
 
-# Set working directory
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
-COPY ./tf_service /app/tf_service
-# Copy requirements and install
-RUN pip install --no-cache-dir -r /app/tf_service/requirements.txt
 
-# Copy the rest of the code
-WORKDIR /app/tf_service
+COPY requirements.txt ./
 
-# Expose FastAPI port
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
 EXPOSE 8000
-# By default start the FastAPI server
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

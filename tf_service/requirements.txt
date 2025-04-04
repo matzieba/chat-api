@@ -1,0 +1,7 @@
+fastapi==0.115.12
+gunicorn[uvicorn]==20.1.0
+uvicorn[standard]==0.20.0
+tensorflow==2.18.0
+chess==1.11.1
+numpy==2.0.2
+boto3==1.37.13
