@@ -1,0 +1,15 @@
+.git
+__pycache__
+*.pyc
+.env
+.venv
+venv
+media/
+data/
+client-secret.json
+firebase-cert.json
+static
+chess_engine/engine/train_supervised/my_refactored_tfrecords
+chess_engine/engine/train_supervised/checkpoints_engine_eval
+chess_engine/engine/train_supervised/my_engine_eval_model_100GB_of_parsed_games_pure_argmax.keras
+chess_engine/

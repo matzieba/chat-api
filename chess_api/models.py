@@ -11,3 +11,10 @@ class ChessGame(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     current_player = models.CharField(max_length=256, default="white", blank=True, null=True)
     human_player = models.ForeignKey(User, on_delete=models.CASCADE, related_name='games')
+    winner = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='won_chess_games'
+    )

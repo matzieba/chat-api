@@ -1,43 +1,27 @@
+
 import random
 
-import tensorflow as tf
+import requests
 from django.db import transaction
-from rest_framework import viewsets, status, serializers
+from rest_framework import viewsets, status
 from rest_framework.response import Response
 import chess
 
+import settings
 from chat_api.models import User
-from chess_api.mcts import run_mcts_batched
 from chess_api.models import ChessGame
+from chess_api.serializers import ChessGameSerializer, PlayerStatisticsSerializer, ChessGameCreateSerializer
 
-
-MODEL_PATH = "/Users/mateuszzieba/Desktop/dev/cvt/chat-api/chat-api/chess_engine/engine/train_supervised/my_engine_eval_model_100GB_of_parsed_games_pure_argmax.keras"
-model = tf.keras.models.load_model(MODEL_PATH)
-
-
-class ChessGameSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ChessGame
-        fields = ['game_id', 'board_state', 'moves', 'game_status', 'created_at', 'current_player']
-
-class ChessGameCreateSerializer(serializers.ModelSerializer):
-    human_player = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=True)
-    game_id = serializers.IntegerField(read_only=True)
-
-    class Meta:
-        model = ChessGame
-        fields = ['human_player', 'game_id']
-
-    def create(self, validated_data):
-        return ChessGame.objects.create(**validated_data)
 
 class GameViewSet(viewsets.ModelViewSet):
     model = ChessGame
     queryset = ChessGame.objects.all()
 
     def get_serializer_class(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action == 'retrieve':
             return ChessGameSerializer
+        elif self.action == 'list':
+            return PlayerStatisticsSerializer
         elif self.action == 'create':
             return ChessGameCreateSerializer
         return ChessGameSerializer
@@ -51,7 +35,16 @@ class GameViewSet(viewsets.ModelViewSet):
 
         player = request.data.get("player", None)
         move_input = request.data.get("move", None)
-
+        action = request.data.get("action", None)
+        if action == "timeout":
+            if player == "white":
+                game.game_status = "w_timeout"
+            else:
+                game.game_status = "b_timeout"
+                game.winner = game.human_player
+            game.save()
+            serializer = self.get_serializer(game)
+            return Response(serializer.data)
         if game.current_player != player:
             return Response({"error": f"It is {game.current_player}'s turn."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -61,21 +54,34 @@ class GameViewSet(viewsets.ModelViewSet):
             chess_move = self.make_player_move(board, move_input)
             if not chess_move:
                 return Response({"error": "Invalid move"}, status=status.HTTP_400_BAD_REQUEST)
-            move = chess_move  # Use the chess.Move object
+            move = chess_move
             game.current_player = 'black'
         elif player == "black":
             if board.is_game_over():
                 game.game_status = self.get_game_status(board)
             else:
-                move = self.get_model_move(board)  # move is a chess.Move object
+                move = self.get_best_move_from_engine(board)
                 board.push(move)
                 game.current_player = 'white'
 
         game.board_state = board.fen()
-        game.moves.append(move.uci())  # Now 'move' is always a chess.Move object
+        game.moves.append(move.uci())
         game.game_status = self.get_game_status(board)
+        if board.is_game_over():
+            if board.is_checkmate():
+                if board.turn:
+                    pass
+                else:
+                    game.winner = game.human_player
+            else:
+                pass
         game.save()
         serializer = self.get_serializer(game)
+        return Response(serializer.data)
+
+    def list(self, request, *args, **kwargs):
+        users = User.objects.all()
+        serializer = self.get_serializer(users, many=True)
         return Response(serializer.data)
 
     @staticmethod
@@ -101,9 +107,16 @@ class GameViewSet(viewsets.ModelViewSet):
             return "draw"
         return "ongoing"
 
-    def get_model_move(self, board: chess.Board) -> chess.Move:
-        best_move = run_mcts_batched(model, board, n_simulations=24, batch_size=12)
-        return best_move
-        # legal_moves_list = list(board.legal_moves)
-        # return random.choice(legal_moves_list)
+    def get_best_move_from_engine(self, board):
+        url = settings.TF_SERVICE_URL + "/bestmove"
+        fen_str = board.fen()
+        try:
+            r = requests.post(url, json={"fen": fen_str})
+            r.raise_for_status()
+            move_dict = r.json()
+            best_move_uci = move_dict["best_move_uci"]
+            best_move = chess.Move.from_uci(best_move_uci)
+            return best_move
 
+        except requests.HTTPError as e:
+            raise ValueError(f"Error calling chess engine service: {e}")
