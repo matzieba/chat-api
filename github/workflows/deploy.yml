@@ -1,0 +1,46 @@
+name: Build and Deploy to AWS
+
+on:
+push:
+branches: [ "main" ]
+
+You can also trigger manually:
+workflow_dispatch:
+
+jobs:
+build_and_deploy:
+runs-on: ubuntu-latest
+
+steps:
+  - name: Check out code
+    uses: actions/checkout@v3
+
+  - name: Configure AWS credentials
+    uses: aws-actions/configure-aws-credentials@v3
+    with:
+      aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      aws-region: ${{ secrets.AWS_REGION }}
+
+  - name: Log in to Amazon ECR
+    run: |
+      aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+        | docker login \
+          --username AWS \
+          --password-stdin 123456789012.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+  - name: Build & push tf_service image
+    uses: docker/build-push-action@v3
+    with:
+      context: ./tf_service
+      file: ./tf_service/Dockerfile
+      push: true
+      tags: 123456789012.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/chat-api-tf_service:latest
+
+  - name: Build & push tf_service image
+    uses: docker/build-push-action@v3
+    with:
+      context: .
+      file: .Dockerfile
+      push: true
+      tags: 123456789012.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/chat-api-django_service:latest
