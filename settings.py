@@ -169,9 +169,15 @@ CORS_ALLOW_HEADERS = [
 if LOCAL:
     MIDDLEWARE.append('querycount.middleware.QueryCountMiddleware')
 
-if os.path.exists(os.path.join(BASE_DIR, 'firebase-cert.json')):
-    with open(os.path.join(BASE_DIR, 'firebase-cert.json')) as firebase_cert_file:
-        FIREBASE_CERT = json.loads(firebase_cert_file.read())
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+firebase_cert_str = os.environ.get("FIREBASE_CERT")
+if firebase_cert_str:
+    FIREBASE_CERT = json.loads(firebase_cert_str)
+else:
+    firebase_cert_path = os.path.join(base_dir, 'firebase-cert.json')
+    if os.path.exists(firebase_cert_path):
+        with open(firebase_cert_path) as f:
+            FIREBASE_CERT = json.loads(f.read())
 
 ROOT_URLCONF = 'urls'
 
