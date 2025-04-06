@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 8000
 
 # Define the entrypoint
-ENTRYPOINT ["gunicorn", "main:app", "-b", ":8000", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "--timeout", "60"]
+ENTRYPOINT ["gunicorn", "main:app", "-b", ":8001", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "--timeout", "60"]
