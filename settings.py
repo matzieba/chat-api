@@ -159,7 +159,7 @@ CORS_ORIGIN_WHITELIST = [
     *CORS_LOCAL,
     "https://chat-api-432810.web.app",
     "https://chat-api-432810.firebaseapp.com",
-    "https://sidzinski.click",
+    "https://chess.sidzinski.click",
 ]
 
 CORS_ALLOW_HEADERS = [
