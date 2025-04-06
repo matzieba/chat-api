@@ -38,10 +38,14 @@ class UserSerializer(WritableNestedModelSerializer):
         return conversation.id
 
     def get_game_id(self, obj):
-        try:
-            game = obj.games.order_by("-created_at").first()
-        except ObjectDoesNotExist:
-            game = ChessGame.objects.create(human_player=obj, board_state=chess.Board().fen(), moves=[], game_status='ongoing')
+        game = obj.games.order_by("-created_at").first()
+        if not game:
+            game = ChessGame.objects.create(
+                human_player=obj,
+                board_state=chess.Board().fen(),
+                moves=[],
+                game_status='ongoing'
+            )
         return game.game_id
 
     def create(self, validated_data):
