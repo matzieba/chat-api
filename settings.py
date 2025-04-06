@@ -159,7 +159,7 @@ CORS_ORIGIN_WHITELIST = [
     *CORS_LOCAL,
     "https://chat-api-432810.web.app",
     "https://chat-api-432810.firebaseapp.com",
-    "https://chess.sidzinski.click",
+    "https://sidzinski.click",
 ]
 
 CORS_ALLOW_HEADERS = [
@@ -252,5 +252,5 @@ SENDGRID_CONFIG = {
     },
 }
 
-TF_SERVICE_URL = "http://tf_service:8000"
+TF_SERVICE_URL = "http://tf_service:8001"
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
