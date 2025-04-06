@@ -70,4 +70,3 @@ firebase-cert.json
 .DS_Store
 .env
 .env.local
-/tf_service/3-4-5/
