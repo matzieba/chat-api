@@ -25,11 +25,10 @@ jobs:
           file: ./tf_service/Dockerfile
           push: true
           tags: 664418978242.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/chat-api-tf_service:latest
-      - name: Build & push tf_service image
+      - name: Build & push django_service image
         uses: docker/build-push-action@v3
         with:
           context: .
-          file: .Dockerfile
           push: true
           tags: 664418978242.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/chat-api-django_service:lates
           
