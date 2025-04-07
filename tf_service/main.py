@@ -29,3 +29,7 @@ def bestmove_endpoint(payload: dict):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/health", status_code=200)
+def health_check():
+    return {"status": "ok"}
