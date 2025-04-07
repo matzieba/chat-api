@@ -252,5 +252,5 @@ SENDGRID_CONFIG = {
     },
 }
 
-TF_SERVICE_URL = "http://tf_service:8001"
+TF_SERVICE_URL = os.environ.get("TF_SERVICE_URL", "http://tf_service:8001")
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
