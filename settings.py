@@ -160,6 +160,8 @@ CORS_ORIGIN_WHITELIST = [
     "https://chat-api-432810.web.app",
     "https://chat-api-432810.firebaseapp.com",
     "https://chess.sidzinski.click",
+    "https://chess-master-sidzinski.s3-website-us-east-1.amazonaws.com/",
+    "http://chess-master-sidzinski.s3-website-us-east-1.amazonaws.com/",
 ]
 
 CORS_ALLOW_HEADERS = [
